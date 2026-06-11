@@ -1,0 +1,527 @@
+// ============================================================================
+// AccessHub — Gestão de Documentação e Controle de Acesso para Obras
+// Prisma Schema (PostgreSQL)
+// ============================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  // Prisma 7: a connection string fica em prisma.config.ts (datasource.url)
+  // e o runtime usa o driver adapter @prisma/adapter-pg.
+  provider = "postgresql"
+}
+
+// ----------------------------------------------------------------------------
+// Enums
+// ----------------------------------------------------------------------------
+
+/// Perfil base: usuário interno ou colaborador/representante de empreiteira.
+enum UserProfile {
+  USER
+  COLLABORATOR
+}
+
+/// Situação de um colaborador na obra.
+enum WorkerStatus {
+  ACTIVE
+  INACTIVE
+  BLOCKED // Bloqueado (ex.: documentação irregular)
+}
+
+/// A quem o documento pertence (tabela polimórfica).
+enum DocumentOwnerType {
+  WORKER
+  CONTRACTOR
+}
+
+/// Tipos de documento mais comuns no contexto de obra/SST.
+enum DocumentType {
+  ASO // Atestado de Saúde Ocupacional
+  NR_35 // Trabalho em altura
+  NR_10 // Eletricidade
+  NR_18 // Construção civil
+  EPI // Ficha de entrega de EPI
+  RG_CPF // Cópia de documento de identificação
+  CONTRATO // Contrato / vínculo da empreiteira
+  CNPJ // Documentos da empresa empreiteira
+  OUTRO
+}
+
+/// Status do workflow de aprovação documental.
+enum DocumentStatus {
+  PENDENTE
+  APROVADO
+  REJEITADO
+}
+
+/// Frequência de cobrança do registro documental.
+enum RequirementFrequency {
+  MONTHLY
+  ONE_TIME
+}
+
+/// Alvo da regra de documentação.
+enum RequirementTarget {
+  WORKER
+  CONTRACTOR
+}
+
+/// Origem da exigência em nível de pessoa/fornecedor.
+enum RequirementSource {
+  FUNCTION_TEMPLATE
+  CONTRACTOR_TYPE_TEMPLATE
+  MANUAL
+}
+
+/// Situação da coleta do registro documental.
+enum RequirementCollectionStatus {
+  NOT_SENT
+  PENDING_APPROVAL
+  APPROVED
+  REJECTED
+  NOT_APPLICABLE
+}
+
+/// Direção do evento na catraca.
+enum AccessDirection {
+  ENTRY
+  EXIT
+}
+
+/// Resultado da tentativa de acesso.
+enum AccessResult {
+  GRANTED
+  DENIED
+}
+
+// ----------------------------------------------------------------------------
+// Tenancy / Identidade
+// ----------------------------------------------------------------------------
+
+/// Tenant principal do SaaS. Representa o cliente contratante (a Obra/Cliente).
+/// Toda a hierarquia (empreiteiras, colaboradores, documentos) pende de uma Company.
+model Company {
+  id           String   @id @default(cuid())
+  name         String
+  legalName    String? // Razão social
+  document     String?  @unique // CNPJ do cliente
+  // Endereço/identificação da obra
+  siteName     String? // Nome da obra (ex.: "Centro Empresarial — SP")
+  addressLine  String?
+  city         String?
+  state        String?
+  active       Boolean  @default(true)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  users       User[]
+  obras       Obra[]
+  contractors Contractor[]
+  workers     Worker[]
+  documents   Document[]
+  accessLogs  AccessLog[]
+  workerFunctions              WorkerFunction[]
+  contractorTypes              ContractorType[]
+  requirementDefinitions       DocumentRequirementDefinition[]
+  workerRequirementItems       WorkerRequirementItem[]
+  contractorRequirementItems   ContractorRequirementItem[]
+
+  @@index([active])
+  @@map("companies")
+}
+
+/// Usuário do sistema, sempre vinculado a uma Company (tenant).
+model User {
+  id           String   @id @default(cuid())
+  companyId    String
+  company      Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  name         String
+  email        String   @unique
+  passwordHash String
+  profile      UserProfile @default(USER)
+  contractorId String?
+  contractor   Contractor? @relation("UserContractor", fields: [contractorId], references: [id], onDelete: SetNull)
+  /// Lista de permissões (chaves de ação) concedidas ao usuário.
+  permissions  Json?
+  active       Boolean  @default(true)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  // Auditoria: documentos avaliados (aprovados/rejeitados) por este usuário.
+  reviewedDocuments Document[] @relation("DocumentReviewer")
+  // Auditoria: documentos enviados/anexados por este usuário.
+  uploadedDocuments Document[] @relation("DocumentUploader")
+  // Acessos registrados por este operador (quando manual).
+  registeredAccess  AccessLog[] @relation("AccessOperator")
+  createdWorkerRequirementItems     WorkerRequirementItem[]   @relation("WorkerRequirementCreatedBy")
+  createdContractorRequirementItems ContractorRequirementItem[] @relation("ContractorRequirementCreatedBy")
+  obraAccess                        UserObraAccess[]
+
+  @@index([companyId])
+  @@index([contractorId])
+  @@map("users")
+}
+
+/// Obra / canteiro vinculado à empresa contratante.
+model Obra {
+  id          String   @id @default(cuid())
+  companyId   String
+  company     Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  name        String
+  code        String?
+  description String?
+  addressLine String?
+  city        String?
+  state       String?
+  active      Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  userAccess  UserObraAccess[]
+  contractors Contractor[]
+  workers     Worker[]
+
+  @@unique([companyId, code])
+  @@index([companyId, active])
+  @@map("obras")
+}
+
+/// Obras liberadas para cada usuário (exceto OWNER/ADMIN, que veem todas).
+model UserObraAccess {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  obraId    String
+  obra      Obra     @relation(fields: [obraId], references: [id], onDelete: Cascade)
+  createdAt DateTime @default(now())
+
+  @@unique([userId, obraId])
+  @@index([obraId])
+  @@map("user_obra_access")
+}
+
+// ----------------------------------------------------------------------------
+// Empreiteira (Contractor)
+// ----------------------------------------------------------------------------
+
+/// Empreiteira/terceiro vinculado a uma obra (Company).
+model Contractor {
+  id          String   @id @default(cuid())
+  companyId   String
+  company     Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  obraId      String
+  obra        Obra     @relation(fields: [obraId], references: [id], onDelete: Cascade)
+  typeId      String?
+  type        ContractorType? @relation(fields: [typeId], references: [id], onDelete: SetNull)
+  name        String
+  legalName   String?
+  cnpj        String?
+  email       String?
+  phone       String?
+  active      Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  workers   Worker[]
+  documents Document[]
+  requirementItems ContractorRequirementItem[]
+  linkedUsers      User[]                      @relation("UserContractor")
+
+  @@unique([obraId, cnpj])
+  @@index([companyId])
+  @@index([obraId])
+  @@index([typeId])
+  @@map("contractors")
+}
+
+// ----------------------------------------------------------------------------
+// Colaborador (Worker)
+// ----------------------------------------------------------------------------
+
+/// Colaborador (terceiro) que acessa a obra. Pertence a uma empreiteira e a uma obra.
+model Worker {
+  id           String       @id @default(cuid())
+  companyId    String
+  company      Company      @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  obraId       String
+  obra         Obra         @relation(fields: [obraId], references: [id], onDelete: Cascade)
+  contractorId String
+  contractor   Contractor   @relation(fields: [contractorId], references: [id], onDelete: Restrict)
+  functionId   String?
+  function     WorkerFunction? @relation(fields: [functionId], references: [id], onDelete: SetNull)
+
+  // Dados pessoais
+  fullName       String
+  cpf            String
+  rg             String?
+  birthDate      DateTime?
+  email          String?
+  phone          String?
+  role           String // Função (ex.: "Pedreiro", "Eletricista")
+  registration   String? // Matrícula (ex.: "CLB-00482")
+  photoUrl       String? // Foto do colaborador (storage)
+
+  // Identificação de crachá / acesso
+  /// Token único do crachá (padrão NEO-0A0AA0) — conteúdo do QR Code.
+  qrHash         String       @unique
+  status         WorkerStatus @default(ACTIVE)
+  /// Validade global do acesso (derivada da documentação; cacheável).
+  accessValidUntil DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  documents  Document[]
+  accessLogs AccessLog[]
+  requirementItems WorkerRequirementItem[]
+
+  @@unique([obraId, cpf])
+  @@index([contractorId])
+  @@index([obraId])
+  @@index([functionId])
+  @@index([companyId, status])
+  @@map("workers")
+}
+
+// ----------------------------------------------------------------------------
+// Documento (polimórfico: pertence a Worker OU a Contractor)
+// ----------------------------------------------------------------------------
+
+/// Cadastro mestre de exigências documentais do tenant.
+/// Ex.: "ASO Periódico", "NR-35", "Contrato Social".
+model DocumentRequirementDefinition {
+  id            String               @id @default(cuid())
+  companyId     String
+  company       Company              @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  target        RequirementTarget
+  name          String
+  documentType  DocumentType
+  frequency     RequirementFrequency
+  monthlyDueDay Int?
+  referenceDate DateTime?
+  active        Boolean              @default(true)
+  createdAt     DateTime             @default(now())
+  updatedAt     DateTime             @updatedAt
+
+  workerFunctionRequirements   WorkerFunctionRequirement[]
+  contractorTypeRequirements   ContractorTypeRequirement[]
+  workerRequirementItems       WorkerRequirementItem[]
+  contractorRequirementItems   ContractorRequirementItem[]
+
+  @@index([companyId, target, active])
+  @@index([companyId, documentType])
+  @@map("document_requirement_definitions")
+}
+
+/// Catálogo de funções de colaborador (Pedreiro, Eletricista, etc.).
+model WorkerFunction {
+  id          String   @id @default(cuid())
+  companyId   String
+  company     Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  name        String
+  description String?
+  active      Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  workers       Worker[]
+  requirements  WorkerFunctionRequirement[]
+
+  @@unique([companyId, name])
+  @@index([companyId, active])
+  @@map("worker_functions")
+}
+
+/// Associação N:N entre função e exigências documentais.
+model WorkerFunctionRequirement {
+  id            String                       @id @default(cuid())
+  functionId    String
+  function      WorkerFunction               @relation(fields: [functionId], references: [id], onDelete: Cascade)
+  requirementId String
+  requirement   DocumentRequirementDefinition @relation(fields: [requirementId], references: [id], onDelete: Cascade)
+  required      Boolean                      @default(true)
+
+  @@unique([functionId, requirementId])
+  @@map("worker_function_requirements")
+}
+
+/// Catálogo de tipos de fornecedor (Transportadora, Locação, etc.).
+model ContractorType {
+  id          String   @id @default(cuid())
+  companyId   String
+  company     Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  name        String
+  description String?
+  active      Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  contractors  Contractor[]
+  requirements ContractorTypeRequirement[]
+
+  @@unique([companyId, name])
+  @@index([companyId, active])
+  @@map("contractor_types")
+}
+
+/// Associação N:N entre tipo de fornecedor e exigências documentais.
+model ContractorTypeRequirement {
+  id            String                        @id @default(cuid())
+  contractorTypeId String
+  contractorType ContractorType               @relation(fields: [contractorTypeId], references: [id], onDelete: Cascade)
+  requirementId String
+  requirement   DocumentRequirementDefinition @relation(fields: [requirementId], references: [id], onDelete: Cascade)
+  required      Boolean                       @default(true)
+
+  @@unique([contractorTypeId, requirementId])
+  @@map("contractor_type_requirements")
+}
+
+/// Exigência documental em nível de colaborador (coleta operacional).
+model WorkerRequirementItem {
+  id             String                     @id @default(cuid())
+  companyId      String
+  company        Company                    @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  workerId       String
+  worker         Worker                     @relation(fields: [workerId], references: [id], onDelete: Cascade)
+  requirementId  String?
+  requirement    DocumentRequirementDefinition? @relation(fields: [requirementId], references: [id], onDelete: SetNull)
+  source         RequirementSource
+  status         RequirementCollectionStatus @default(NOT_SENT)
+  naReason       String?
+  // Snapshot da regra no momento da criação (suporta edição do catálogo sem perder histórico).
+  name           String
+  documentType   DocumentType
+  frequency      RequirementFrequency
+  monthlyDueDay  Int?
+  referenceDate  DateTime?
+  latestDocumentId String?
+  latestDocument Document?                  @relation("WorkerRequirementLatestDocument", fields: [latestDocumentId], references: [id], onDelete: SetNull)
+  createdById    String?
+  createdBy      User?                      @relation("WorkerRequirementCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+  createdAt      DateTime                   @default(now())
+  updatedAt      DateTime                   @updatedAt
+
+  submittedDocuments Document[]             @relation("WorkerRequirementDocuments")
+
+  @@index([companyId, workerId, status])
+  @@index([requirementId])
+  @@unique([latestDocumentId])
+  @@map("worker_requirement_items")
+}
+
+/// Exigência documental em nível de fornecedor (coleta operacional).
+model ContractorRequirementItem {
+  id             String                     @id @default(cuid())
+  companyId      String
+  company        Company                    @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  contractorId   String
+  contractor     Contractor                 @relation(fields: [contractorId], references: [id], onDelete: Cascade)
+  requirementId  String?
+  requirement    DocumentRequirementDefinition? @relation(fields: [requirementId], references: [id], onDelete: SetNull)
+  source         RequirementSource
+  status         RequirementCollectionStatus @default(NOT_SENT)
+  naReason       String?
+  name           String
+  documentType   DocumentType
+  frequency      RequirementFrequency
+  monthlyDueDay  Int?
+  referenceDate  DateTime?
+  latestDocumentId String?
+  latestDocument Document?                  @relation("ContractorRequirementLatestDocument", fields: [latestDocumentId], references: [id], onDelete: SetNull)
+  createdById    String?
+  createdBy      User?                      @relation("ContractorRequirementCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+  createdAt      DateTime                   @default(now())
+  updatedAt      DateTime                   @updatedAt
+
+  submittedDocuments Document[]             @relation("ContractorRequirementDocuments")
+
+  @@index([companyId, contractorId, status])
+  @@index([requirementId])
+  @@unique([latestDocumentId])
+  @@map("contractor_requirement_items")
+}
+
+/// Documento anexado a um Worker ou a uma Contractor.
+/// Polimorfismo via discriminador `ownerType` + FKs nuláveis (`workerId`/`contractorId`).
+/// Regra de integridade: exatamente uma das FKs deve estar preenchida, coerente com `ownerType`
+/// (aplicada na camada de serviço e, opcionalmente, via CHECK constraint em migration).
+model Document {
+  id        String            @id @default(cuid())
+  companyId String
+  company   Company           @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  ownerType DocumentOwnerType
+  workerId     String?
+  worker       Worker?     @relation(fields: [workerId], references: [id], onDelete: Cascade)
+  contractorId String?
+  contractor   Contractor? @relation(fields: [contractorId], references: [id], onDelete: Cascade)
+  workerRequirementItemId     String?
+  workerRequirementItem       WorkerRequirementItem? @relation("WorkerRequirementDocuments", fields: [workerRequirementItemId], references: [id], onDelete: SetNull)
+  contractorRequirementItemId String?
+  contractorRequirementItem   ContractorRequirementItem? @relation("ContractorRequirementDocuments", fields: [contractorRequirementItemId], references: [id], onDelete: SetNull)
+
+  type        DocumentType
+  title       String? // Rótulo livre (ex.: "ASO admissional")
+  fileUrl     String // URL no storage
+  fileKey     String? // Chave/objeto no bucket (para exclusão/assinatura)
+  mimeType    String?
+  fileSize    Int?
+  issuedAt    DateTime? // Data de emissão
+  expiresAt   DateTime? // Data de validade
+
+  // Workflow de aprovação + auditoria
+  status          DocumentStatus @default(PENDENTE)
+  uploadedById    String?
+  uploadedBy      User?          @relation("DocumentUploader", fields: [uploadedById], references: [id], onDelete: SetNull)
+  reviewedById    String?
+  reviewedBy      User?          @relation("DocumentReviewer", fields: [reviewedById], references: [id], onDelete: SetNull)
+  reviewedAt      DateTime?
+  rejectionReason String?
+  workerRequirementItemAsLatest     WorkerRequirementItem?     @relation("WorkerRequirementLatestDocument")
+  contractorRequirementItemAsLatest ContractorRequirementItem? @relation("ContractorRequirementLatestDocument")
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([companyId, status])
+  @@index([workerId])
+  @@index([contractorId])
+  @@index([workerRequirementItemId])
+  @@index([contractorRequirementItemId])
+  @@index([uploadedById])
+  @@index([ownerType, status])
+  @@index([expiresAt])
+  @@map("documents")
+}
+
+// ----------------------------------------------------------------------------
+// Log de acesso (Catraca)
+// ----------------------------------------------------------------------------
+
+/// Registro de cada evento de acesso na catraca/portaria.
+model AccessLog {
+  id        String          @id @default(cuid())
+  companyId String
+  company   Company         @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  workerId  String?
+  worker    Worker?         @relation(fields: [workerId], references: [id], onDelete: SetNull)
+
+  direction AccessDirection
+  result    AccessResult    @default(GRANTED)
+  reason    String? // Motivo de negação (ex.: "ASO vencido", "QR inválido")
+  gate      String? // Identificação da catraca/portão
+  qrHash    String? // Hash lido (auditoria mesmo se worker não resolvido)
+
+  // Operador que registrou (quando aplicável)
+  operatorId String?
+  operator   User?    @relation("AccessOperator", fields: [operatorId], references: [id], onDelete: SetNull)
+
+  occurredAt DateTime @default(now())
+
+  @@index([companyId, occurredAt])
+  @@index([workerId, occurredAt])
+  @@map("access_logs")
+}

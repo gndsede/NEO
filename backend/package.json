@@ -1,0 +1,61 @@
+{
+  "name": "neo-accesshub-backend",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Backend do SaaS de Gestão de Documentação e Controle de Acesso para Obras e Empreiteiras (AccessHub).",
+  "type": "module",
+  "main": "dist/server.js",
+  "scripts": {
+    "dev": "tsx watch src/server.ts",
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/server.js",
+    "lint": "eslint .",
+    "prisma:generate": "prisma generate",
+    "prisma:migrate": "prisma migrate dev",
+    "prisma:studio": "prisma studio",
+    "db:seed": "tsx prisma/seed.ts"
+  },
+  "prisma": {
+    "seed": "tsx prisma/seed.ts"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.1060.0",
+    "@aws-sdk/s3-request-presigner": "^3.1060.0",
+    "@prisma/adapter-pg": "^7.8.0",
+    "@prisma/client": "^7.8.0",
+    "@supabase/supabase-js": "^2.107.0",
+    "bcryptjs": "^3.0.3",
+    "cors": "^2.8.6",
+    "dotenv": "^17.4.2",
+    "express": "^5.2.1",
+    "helmet": "^8.2.0",
+    "jsonwebtoken": "^9.0.3",
+    "morgan": "^1.11.0",
+    "multer": "^2.1.1",
+    "pdfkit": "^0.19.0",
+    "pg": "^8.21.0",
+    "qrcode": "^1.5.4",
+    "sharp": "^0.34.5",
+    "xlsx": "^0.18.5",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@types/bcryptjs": "^2.4.6",
+    "@types/cors": "^2.8.19",
+    "@types/express": "^5.0.6",
+    "@types/jsonwebtoken": "^9.0.10",
+    "@types/morgan": "^1.9.10",
+    "@types/multer": "^2.1.0",
+    "@types/node": "^25.9.1",
+    "@types/pdfkit": "^0.17.6",
+    "@types/pg": "^8.20.0",
+    "@types/qrcode": "^1.5.6",
+    "@types/sharp": "^0.31.1",
+    "prisma": "^7.8.0",
+    "tsx": "^4.22.4",
+    "typescript": "^6.0.3"
+  }
+}
