@@ -1,0 +1,7 @@
+[submodule "app-catraca"]
+	path = app-catraca
+	url = https://github.com/IuriD7/app-catraca.git
+
+[submodule "ingress-craftsman"]
+	path = ingress-craftsman
+	url = https://github.com/IuriD7/ingress-craftsman.git
