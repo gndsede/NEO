@@ -5,6 +5,7 @@ import {
   AccessResult,
   DocumentStatus,
   DocumentType,
+  Prisma,
   RequirementCollectionStatus,
   WorkerStatus,
 } from "@prisma/client";
@@ -311,14 +312,36 @@ router.post(
       const token = normalizeScannedQr(item.qr);
       const occurredAt = item.occurredAt ? new Date(item.occurredAt) : new Date();
 
+      // Idempotência: se este clientId já foi processado (reenvio da fila após
+      // resposta perdida), devolve o registro existente sem duplicar o log.
+      if (item.clientId) {
+        const existing = await prisma.accessLog.findUnique({
+          where: {
+            companyId_clientId: { companyId: company, clientId: item.clientId },
+          },
+          select: { id: true, result: true, reason: true, workerId: true },
+        });
+        if (existing) {
+          results.push({
+            clientId: item.clientId,
+            result: existing.result === AccessResult.GRANTED ? "GRANTED" : "DENIED",
+            reason: existing.reason ?? undefined,
+            logId: existing.id,
+            workerId: existing.workerId ?? undefined,
+          });
+          continue;
+        }
+      }
+
       const recordDeny = async (
         reason: string,
         directionForLog: AccessDirection,
         workerId?: string,
       ) => {
-        const log = await prisma.accessLog.create({
+        const log = await createBatchLog({
+          companyId: company,
+          clientId: item.clientId,
           data: {
-            companyId: company,
             workerId,
             direction: directionForLog,
             gate: item.gate,
@@ -331,10 +354,10 @@ router.post(
         });
         results.push({
           clientId: item.clientId ?? null,
-          result: "DENIED",
-          reason,
+          result: log.result === AccessResult.GRANTED ? "GRANTED" : "DENIED",
+          reason: log.reason ?? reason,
           logId: log.id,
-          workerId,
+          workerId: log.workerId ?? workerId,
         });
       };
 
@@ -403,9 +426,10 @@ router.post(
         continue;
       }
 
-      const log = await prisma.accessLog.create({
+      const log = await createBatchLog({
+        companyId: company,
+        clientId: item.clientId,
         data: {
-          companyId: company,
           workerId: worker.id,
           direction,
           gate: item.gate,
@@ -417,9 +441,10 @@ router.post(
       });
       results.push({
         clientId: item.clientId ?? null,
-        result: "GRANTED",
+        result: log.result === AccessResult.GRANTED ? "GRANTED" : "DENIED",
+        reason: log.reason ?? undefined,
         logId: log.id,
-        workerId: worker.id,
+        workerId: log.workerId ?? worker.id,
       });
     }
 

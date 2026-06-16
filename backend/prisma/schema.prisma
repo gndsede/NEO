@@ -552,8 +552,14 @@ model AccessLog {
   operatorId String?
   operator   User?    @relation("AccessOperator", fields: [operatorId], references: [id], onDelete: SetNull)
 
+  // ID gerado pelo app no modo offline. Garante idempotência do batch:
+  // o reenvio da fila (quando a resposta se perde) não duplica o registro.
+  // Nulo em scans online; NULLs são distintos no índice único (Postgres).
+  clientId String?
+
   occurredAt DateTime @default(now())
 
+  @@unique([companyId, clientId])
   @@index([companyId, occurredAt])
   @@index([workerId, occurredAt])
   @@map("access_logs")
