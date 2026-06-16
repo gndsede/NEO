@@ -8,6 +8,10 @@ import { prisma } from "../../lib/prisma.js";
 import { getStorage } from "../../lib/storage/index.js";
 import { BadRequest, Forbidden, NotFound } from "../../lib/errors.js";
 import { recomputeWorkerAccessValidity } from "../workers/worker.access.js";
+import {
+  recomputeRequirementItem,
+  recomputeWorkerRequirements,
+} from "../requirements/requirement-status.js";
 import type {
   AttachDocumentInput,
   ListDocumentsQuery,
@@ -119,11 +123,6 @@ export class DocumentService {
       },
     });
 
-    // Recalcula validade de acesso do colaborador (documentação consolidada).
-    if (updated.ownerType === DocumentOwnerType.WORKER && updated.workerId) {
-      await recomputeWorkerAccessValidity(updated.workerId);
-    }
-
     if (updated.workerRequirementItemId) {
       await prisma.workerRequirementItem.update({
         where: { id: updated.workerRequirementItemId },
@@ -133,6 +132,7 @@ export class DocumentService {
           latestDocumentId: updated.id,
         },
       });
+      await recomputeRequirementItem(updated.workerRequirementItemId);
     }
     if (updated.contractorRequirementItemId) {
       await prisma.contractorRequirementItem.update({
@@ -143,6 +143,12 @@ export class DocumentService {
           latestDocumentId: updated.id,
         },
       });
+    }
+
+    // Recalcula validade de acesso + situações efetivas das exigências do worker.
+    if (updated.ownerType === DocumentOwnerType.WORKER && updated.workerId) {
+      await recomputeWorkerAccessValidity(updated.workerId);
+      await recomputeWorkerRequirements(updated.workerId);
     }
 
     return updated;
@@ -172,10 +178,6 @@ export class DocumentService {
       },
     });
 
-    if (updated.ownerType === DocumentOwnerType.WORKER && updated.workerId) {
-      await recomputeWorkerAccessValidity(updated.workerId);
-    }
-
     if (updated.workerRequirementItemId) {
       await prisma.workerRequirementItem.update({
         where: { id: updated.workerRequirementItemId },
@@ -184,6 +186,7 @@ export class DocumentService {
           latestDocumentId: updated.id,
         },
       });
+      await recomputeRequirementItem(updated.workerRequirementItemId);
     }
     if (updated.contractorRequirementItemId) {
       await prisma.contractorRequirementItem.update({
@@ -193,6 +196,11 @@ export class DocumentService {
           latestDocumentId: updated.id,
         },
       });
+    }
+
+    if (updated.ownerType === DocumentOwnerType.WORKER && updated.workerId) {
+      await recomputeWorkerAccessValidity(updated.workerId);
+      await recomputeWorkerRequirements(updated.workerId);
     }
 
     return updated;
@@ -290,6 +298,7 @@ export class DocumentService {
           latestDocumentId: created.id,
         },
       });
+      await recomputeRequirementItem(created.workerRequirementItemId);
     }
     if (created.contractorRequirementItemId) {
       await prisma.contractorRequirementItem.update({

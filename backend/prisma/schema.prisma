@@ -84,6 +84,26 @@ enum RequirementCollectionStatus {
   NOT_APPLICABLE
 }
 
+/// Estágio fino dentro de uma coleta em andamento (visão operacional da aba Pendentes).
+enum RequirementStage {
+  NONE
+  AWAITING_UPLOAD // exigência criada, sem anexo
+  AWAITING_SIGNATURE // anexo enviado, falta assinatura
+  AWAITING_REVIEW // pronto para o avaliador
+}
+
+/// Situação efetiva (derivada de status + datas) que alimenta os ícones do funil.
+/// Desnormalizada em coluna indexada para listar/contar rápido com 1000+ colaboradores.
+enum EffectiveRequirementStatus {
+  EM_FALTA // NOT_SENT
+  AGUARDANDO // PENDING_APPROVAL
+  REPROVADO // REJECTED
+  VIGENTE // APPROVED, dentro da validade
+  PROX_VENCIMENTO // APPROVED, vence em <= 30 dias
+  VENCIDO // APPROVED, validade expirada
+  NA // NOT_APPLICABLE
+}
+
 /// Direção do evento na catraca.
 enum AccessDirection {
   ENTRY
@@ -404,10 +424,23 @@ model WorkerRequirementItem {
   createdAt      DateTime                   @default(now())
   updatedAt      DateTime                   @updatedAt
 
+  // --- Nova camada "entidade com status" (funil + visão operacional) ---
+  /// Prazo desejado de aprovação (deadline). Alimenta os filtros da aba Pendentes.
+  dueDate         DateTime?
+  /// Estágio fino dentro de uma coleta pendente.
+  stage           RequirementStage @default(NONE)
+  /// Situação efetiva derivada (status + datas). Recalculada a cada mudança e no job diário.
+  effectiveStatus EffectiveRequirementStatus @default(EM_FALTA)
+  /// Validade copiada do latestDocument (índice para ordenar/filtrar vencimentos).
+  expiresAt       DateTime?
+
   submittedDocuments Document[]             @relation("WorkerRequirementDocuments")
 
   @@index([companyId, workerId, status])
   @@index([requirementId])
+  @@index([companyId, effectiveStatus]) // funil por situação
+  @@index([companyId, dueDate]) // ordenar por deadline
+  @@index([workerId, effectiveStatus]) // chips por colaborador
   @@unique([latestDocumentId])
   @@map("worker_requirement_items")
 }

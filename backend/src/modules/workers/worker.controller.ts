@@ -89,6 +89,13 @@ export const workerController = {
     res.json(withAccessToken(worker));
   },
 
+  /** GET /workers/requirements-summary — contadores do funil por situação */
+  async requirementsSummary(req: Request, res: Response) {
+    const scope = scopeFromRequest(req);
+    const summary = await workerService.requirementsSummary(scope);
+    res.json(summary);
+  },
+
   /** GET /workers/:id/requirements */
   async listRequirements(req: Request, res: Response) {
     const scope = scopeFromRequest(req);

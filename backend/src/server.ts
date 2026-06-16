@@ -5,6 +5,10 @@ import {
   startAutoExitScheduler,
   stopAutoExitScheduler,
 } from "./modules/access/access.auto-exit.js";
+import {
+  startRequirementStatusScheduler,
+  stopRequirementStatusScheduler,
+} from "./modules/requirements/requirement-status.scheduler.js";
 
 async function bootstrap() {
   const app = createApp();
@@ -19,11 +23,13 @@ async function bootstrap() {
   });
 
   startAutoExitScheduler();
+  startRequirementStatusScheduler();
 
   const shutdown = async (signal: string) => {
     // eslint-disable-next-line no-console
     console.log(`\n${signal} recebido. Encerrando...`);
     stopAutoExitScheduler();
+    stopRequirementStatusScheduler();
     server.close(async () => {
       await prisma.$disconnect();
       process.exit(0);

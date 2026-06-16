@@ -1,6 +1,10 @@
 import { Router, type Request } from "express";
 import { z } from "zod";
-import { DocumentStatus, WorkerStatus } from "@prisma/client";
+import {
+  DocumentStatus,
+  RequirementCollectionStatus,
+  WorkerStatus,
+} from "@prisma/client";
 import { prisma } from "../../lib/prisma.js";
 import { asyncHandler } from "../../middleware/async-handler.js";
 import { authenticate, requireCapability } from "../../middleware/auth.js";
@@ -90,6 +94,29 @@ router.get(
       revokedTokens = revoked.map((w) => w.qrHash);
     }
 
+    // Consolida quais workers do lote têm exigências documentais pendentes,
+    // para que o app possa bloquear offline com o mesmo critério do online.
+    const workerIds = workers.map((w) => w.id);
+    const pendingSet = new Set<string>();
+    if (workerIds.length > 0) {
+      const pending = await prisma.workerRequirementItem.findMany({
+        where: {
+          companyId: company,
+          workerId: { in: workerIds },
+          status: {
+            in: [
+              RequirementCollectionStatus.NOT_SENT,
+              RequirementCollectionStatus.PENDING_APPROVAL,
+              RequirementCollectionStatus.REJECTED,
+            ],
+          },
+        },
+        select: { workerId: true },
+        distinct: ["workerId"],
+      });
+      for (const p of pending) pendingSet.add(p.workerId);
+    }
+
     const now = new Date();
 
     res.json({
@@ -108,6 +135,7 @@ router.get(
         status: w.status,
         accessValidUntil: w.accessValidUntil?.toISOString() ?? null,
         hasRejectedDocument: w.documents.length > 0,
+        hasPendingRequirements: pendingSet.has(w.id),
         contractor: w.contractor
           ? { id: w.contractor.id, name: w.contractor.name }
           : null,

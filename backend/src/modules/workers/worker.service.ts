@@ -15,6 +15,7 @@ import {
   workerScopeWhere,
 } from "../../lib/scope.js";
 import { generateNeoAccessToken } from "../../utils/access-hash.js";
+import { recomputeRequirementItem } from "../requirements/requirement-status.js";
 import {
   importWorkerRowSchema,
   type AddManualWorkerRequirementInput,
@@ -457,6 +458,35 @@ export class WorkerService {
     });
   }
 
+  /**
+   * Contadores do "funil" — quantas exigências há em cada situação efetiva,
+   * dentro do escopo (obra) do usuário. Alimenta os indicadores e a navegação
+   * por situação. Uma única query agregada (groupBy), escala com 1000+.
+   */
+  async requirementsSummary(scope: AuthScope) {
+    const grouped = await prisma.workerRequirementItem.groupBy({
+      by: ["effectiveStatus"],
+      where: { companyId: scope.companyId, worker: workerScopeWhere(scope) },
+      _count: { _all: true },
+    });
+
+    const counts: Record<string, number> = {
+      EM_FALTA: 0,
+      AGUARDANDO: 0,
+      REPROVADO: 0,
+      VENCIDO: 0,
+      PROX_VENCIMENTO: 0,
+      VIGENTE: 0,
+      NA: 0,
+    };
+    for (const g of grouped) counts[g.effectiveStatus] = g._count._all;
+
+    const pendentes =
+      counts.EM_FALTA + counts.AGUARDANDO + counts.REPROVADO + counts.VENCIDO;
+
+    return { counts, pendentes };
+  }
+
   async listRequirements(scope: AuthScope, workerId: string) {
     const companyId = scope.companyId;
     await this.findById(scope, workerId);
@@ -505,7 +535,7 @@ export class WorkerService {
       throw BadRequest("Para cobrança mensal, informe `monthlyDueDay` (1-31).");
     }
 
-    return prisma.workerRequirementItem.create({
+    const created = await prisma.workerRequirementItem.create({
       data: {
         companyId,
         workerId,
@@ -519,6 +549,8 @@ export class WorkerService {
         createdById,
       },
     });
+    await recomputeRequirementItem(created.id);
+    return created;
   }
 
   async setRequirementApplicability(
@@ -542,7 +574,7 @@ export class WorkerService {
       throw BadRequest("Ao marcar N/A, informe `naReason`.");
     }
 
-    return prisma.workerRequirementItem.update({
+    const updated = await prisma.workerRequirementItem.update({
       where: { id: itemId },
       data: {
         status: data.status,
@@ -552,6 +584,8 @@ export class WorkerService {
             : null,
       },
     });
+    await recomputeRequirementItem(itemId);
+    return updated;
   }
 }
 
