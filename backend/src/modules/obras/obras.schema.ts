@@ -8,6 +8,8 @@ export const obraUpsertSchema = z.object({
   city: z.string().trim().optional(),
   state: z.string().trim().optional(),
   active: z.coerce.boolean().optional(),
+  dataInicio: z.string().optional().nullable(),
+  dataTerminoPrevisto: z.string().optional().nullable(),
 });
 
 export const assignUserObrasSchema = z.object({

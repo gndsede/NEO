@@ -31,7 +31,11 @@ router.post(
 );
 
 router.get("/", asyncHandler(workerController.list));
-// Rota literal precisa vir antes de "/:id" para não ser capturada como id.
+// Rotas literais precisam vir antes de "/:id" para não serem capturadas como id.
+router.get(
+  "/requirements",
+  asyncHandler(workerController.listAllRequirements),
+);
 router.get(
   "/requirements-summary",
   asyncHandler(workerController.requirementsSummary),

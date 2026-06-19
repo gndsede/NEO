@@ -100,6 +100,8 @@ router.post(
         city: data.city,
         state: data.state,
         active: data.active ?? true,
+        dataInicio: data.dataInicio ? new Date(data.dataInicio) : null,
+        dataTerminoPrevisto: data.dataTerminoPrevisto ? new Date(data.dataTerminoPrevisto) : null,
       },
     });
 
@@ -135,9 +137,14 @@ router.patch(
       if (duplicate) throw BadRequest("Já existe uma obra com este código.");
     }
 
+    const { dataInicio, dataTerminoPrevisto, ...rest } = data;
     const item = await prisma.obra.update({
       where: { id },
-      data,
+      data: {
+        ...rest,
+        ...(dataInicio !== undefined ? { dataInicio: dataInicio ? new Date(dataInicio) : null } : {}),
+        ...(dataTerminoPrevisto !== undefined ? { dataTerminoPrevisto: dataTerminoPrevisto ? new Date(dataTerminoPrevisto) : null } : {}),
+      },
     });
     res.json(item);
   }),

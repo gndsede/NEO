@@ -12,10 +12,69 @@ import {
   recomputeRequirementItem,
   recomputeWorkerRequirements,
 } from "../requirements/requirement-status.js";
+import {
+  sendRejectionNotice,
+  type RejectionNoticeInput,
+} from "../notifications/notification.service.js";
 import type {
   AttachDocumentInput,
   ListDocumentsQuery,
 } from "./document.schema.js";
+
+// Busca dados do documento rejeitado e dispara o email à empreiteira.
+// Executado como fire-and-forget — nunca lança para o caller.
+async function notifyRejection(doc: {
+  id: string;
+  companyId: string;
+  ownerType: DocumentOwnerType;
+  workerId: string | null;
+  contractorId: string | null;
+  type: string;
+  title: string | null;
+  rejectionReason: string | null;
+}): Promise<void> {
+  const documentName = doc.title ?? doc.type;
+  const reason = doc.rejectionReason ?? "Motivo não informado";
+
+  let payload: RejectionNoticeInput | null = null;
+
+  if (doc.ownerType === DocumentOwnerType.WORKER && doc.workerId) {
+    const worker = await prisma.worker.findUnique({
+      where: { id: doc.workerId },
+      select: {
+        fullName: true,
+        contractor: { select: { name: true, email: true } },
+      },
+    });
+    if (!worker?.contractor.email) return;
+    payload = {
+      companyId: doc.companyId,
+      documentId: doc.id,
+      workerName: worker.fullName,
+      documentName,
+      rejectionReason: reason,
+      contractorName: worker.contractor.name,
+      contractorEmail: worker.contractor.email,
+    };
+  } else if (doc.ownerType === DocumentOwnerType.CONTRACTOR && doc.contractorId) {
+    const contractor = await prisma.contractor.findUnique({
+      where: { id: doc.contractorId },
+      select: { name: true, email: true },
+    });
+    if (!contractor?.email) return;
+    payload = {
+      companyId: doc.companyId,
+      documentId: doc.id,
+      workerName: contractor.name,
+      documentName,
+      rejectionReason: reason,
+      contractorName: contractor.name,
+      contractorEmail: contractor.email,
+    };
+  }
+
+  if (payload) await sendRejectionNotice(payload);
+}
 
 interface UploadedFile {
   buffer: Buffer;
@@ -202,6 +261,9 @@ export class DocumentService {
       await recomputeWorkerAccessValidity(updated.workerId);
       await recomputeWorkerRequirements(updated.workerId);
     }
+
+    // Notifica a empreiteira sobre a reprovação (fire-and-forget)
+    void notifyRejection(updated).catch(() => undefined);
 
     return updated;
   }

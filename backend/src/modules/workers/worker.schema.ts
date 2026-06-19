@@ -1,6 +1,7 @@
 import { z } from "zod";
 import {
   DocumentType,
+  EffectiveRequirementStatus,
   RequirementCollectionStatus,
   RequirementFrequency,
   WorkerStatus,
@@ -25,6 +26,19 @@ const dateLike = z
     message: "Data inválida (use ISO 8601, ex.: 2026-12-31)",
   })
   .transform((v) => (v ? new Date(v) : undefined));
+
+/**
+ * Horário no formato HH:MM (24h). Aceita string vazia / null para limpar
+ * o campo no PATCH (vira null no banco).
+ */
+const shiftTimeLike = z
+  .union([z.string(), z.null()])
+  .optional()
+  .transform((v) => (v === "" || v === undefined ? undefined : v))
+  .refine(
+    (v) => v === undefined || v === null || /^([01]\d|2[0-3]):[0-5]\d$/.test(v),
+    { message: "Horário deve estar no formato HH:MM (ex.: 07:30)" },
+  );
 
 /**
  * Metadados dos documentos enviados no cadastro. Enviar como JSON string
@@ -58,6 +72,8 @@ export const createWorkerSchema = z.object({
   phone: optionalString,
   role: z.string().trim().min(2, "Função é obrigatória"),
   registration: optionalString,
+  shiftStart: shiftTimeLike,
+  shiftEnd: shiftTimeLike,
   documentsMeta: z
     .string()
     .optional()
@@ -84,7 +100,7 @@ export type CreateWorkerInput = z.infer<typeof createWorkerSchema>;
 export type DocumentMeta = z.infer<typeof documentMetaSchema>;
 
 export const updateWorkerSchema = createWorkerSchema
-  .omit({ documentsMeta: true, contractorId: true })
+  .omit({ documentsMeta: true })
   .partial()
   .extend({
     status: z.nativeEnum(WorkerStatus).optional(),
@@ -117,8 +133,42 @@ export const importWorkersSchema = z.object({
 export type ImportWorkerRow = z.infer<typeof importWorkerRowSchema>;
 
 export const listWorkersQuerySchema = z.object({
+  // Filtros granulares (operador "Contém" / "Igual a")
+  name: z.string().optional(),
+  cpf: z.string().optional(),
+  rg: z.string().optional(),
+  registration: z.string().optional(),
+  email: z.string().optional(),
   contractorId: z.string().optional(),
+  functionId: z.string().optional(),
+
+  /** Turno: DAY (diurno) | NIGHT (noturno) | NONE (sem turno cadastrado). */
+  shift: z.enum(["DAY", "NIGHT", "NONE"]).optional(),
+  /** "true" devolve só quem tem foto; "false" só quem não tem. */
+  hasPhoto: z
+    .enum(["true", "false"])
+    .optional()
+    .transform((v) => (v === undefined ? undefined : v === "true")),
+
   status: z.enum(["ACTIVE", "INACTIVE", "BLOCKED"]).optional(),
+  createdFrom: dateLike,
+  createdTo: dateLike,
+
+  /**
+   * Filtra colaboradores que possuem ao menos uma exigência com o status efetivo informado.
+   * Aceita um ou múltiplos valores: ?effectiveStatus=EM_FALTA&effectiveStatus=AGUARDANDO
+   */
+  effectiveStatus: z
+    .union([
+      z.nativeEnum(EffectiveRequirementStatus),
+      z.array(z.nativeEnum(EffectiveRequirementStatus)),
+    ])
+    .optional()
+    .transform((v) =>
+      v === undefined ? undefined : Array.isArray(v) ? v : [v],
+    ),
+
+  /** Busca global fallback (usada quando o front mantém um único campo). */
   search: z.string().optional(),
   page: z.coerce.number().int().positive().default(1),
   pageSize: z.coerce.number().int().positive().max(1000).default(20),
@@ -137,6 +187,24 @@ export const addManualWorkerRequirementSchema = z.object({
 export type AddManualWorkerRequirementInput = z.infer<
   typeof addManualWorkerRequirementSchema
 >;
+
+export const listAllRequirementsQuerySchema = z.object({
+  effectiveStatus: z
+    .union([
+      z.nativeEnum(EffectiveRequirementStatus),
+      z.array(z.nativeEnum(EffectiveRequirementStatus)),
+    ])
+    .optional()
+    .transform((v) =>
+      v === undefined ? undefined : Array.isArray(v) ? v : [v],
+    ),
+  contractorId: z.string().optional(),
+  workerId: z.string().optional(),
+  page: z.coerce.number().int().positive().default(1),
+  pageSize: z.coerce.number().int().positive().max(200).default(50),
+});
+
+export type ListAllRequirementsQuery = z.infer<typeof listAllRequirementsQuerySchema>;
 
 export const setWorkerRequirementApplicabilitySchema = z.object({
   status: z.enum([

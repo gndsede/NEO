@@ -9,6 +9,10 @@ import {
   startRequirementStatusScheduler,
   stopRequirementStatusScheduler,
 } from "./modules/requirements/requirement-status.scheduler.js";
+import {
+  startNotificationScheduler,
+  stopNotificationScheduler,
+} from "./modules/notifications/notification.scheduler.js";
 
 async function bootstrap() {
   const app = createApp();
@@ -24,12 +28,14 @@ async function bootstrap() {
 
   startAutoExitScheduler();
   startRequirementStatusScheduler();
+  startNotificationScheduler();
 
   const shutdown = async (signal: string) => {
     // eslint-disable-next-line no-console
     console.log(`\n${signal} recebido. Encerrando...`);
     stopAutoExitScheduler();
     stopRequirementStatusScheduler();
+    stopNotificationScheduler();
     server.close(async () => {
       await prisma.$disconnect();
       process.exit(0);

@@ -93,6 +93,36 @@ function formatPendingReason(items: PendingRequirementSummary[]): string {
   return `Documentação pendente: ${list}`;
 }
 
+/**
+ * Cria um AccessLog persistindo `clientId` para idempotência do batch offline.
+ * Se uma corrida criar um log com o mesmo clientId entre a checagem inicial e
+ * o insert (Prisma P2002), recupera o registro existente em vez de duplicar.
+ */
+async function createBatchLog(params: {
+  companyId: string;
+  clientId?: string;
+  data: Omit<Prisma.AccessLogUncheckedCreateInput, "companyId" | "clientId">;
+}) {
+  const { companyId, clientId, data } = params;
+  try {
+    return await prisma.accessLog.create({
+      data: { ...data, companyId, clientId: clientId ?? null },
+    });
+  } catch (e) {
+    if (
+      clientId &&
+      e instanceof Prisma.PrismaClientKnownRequestError &&
+      e.code === "P2002"
+    ) {
+      const existing = await prisma.accessLog.findUnique({
+        where: { companyId_clientId: { companyId, clientId } },
+      });
+      if (existing) return existing;
+    }
+    throw e;
+  }
+}
+
 const router = Router();
 router.use(authenticate);
 
@@ -459,10 +489,17 @@ router.post(
 
 const listSchema = z.object({
   workerId: z.string().optional(),
+  workerName: z.string().optional(),
   result: z.nativeEnum(AccessResult).optional(),
   direction: z.nativeEnum(AccessDirection).optional(),
   /** ISO date/datetime — filtra acessos a partir desse instante (inclusive). */
   from: z
+    .string()
+    .datetime({ offset: true })
+    .optional()
+    .transform((v) => (v ? new Date(v) : undefined)),
+  /** ISO date/datetime — filtra acessos até esse instante (inclusive). */
+  to: z
     .string()
     .datetime({ offset: true })
     .optional()
@@ -474,16 +511,64 @@ const listSchema = z.object({
 });
 
 router.get(
+  "/today-summary",
+  asyncHandler(async (req, res) => {
+    const company = companyId(req);
+    const dayStart = new Date();
+    dayStart.setHours(0, 0, 0, 0);
+
+    const logs = await prisma.accessLog.findMany({
+      where: { companyId: company, occurredAt: { gte: dayStart } },
+      select: { occurredAt: true, direction: true, result: true },
+      orderBy: { occurredAt: "asc" },
+    });
+
+    let entries = 0, exits = 0, denied = 0;
+    const hourlyMap: Record<number, { entries: number; exits: number }> = {};
+
+    for (const log of logs) {
+      const h = new Date(log.occurredAt).getHours();
+      if (!hourlyMap[h]) hourlyMap[h] = { entries: 0, exits: 0 };
+      if (log.result === "DENIED") {
+        denied++;
+      } else if (log.direction === "ENTRY") {
+        entries++;
+        hourlyMap[h].entries++;
+      } else {
+        exits++;
+        hourlyMap[h].exits++;
+      }
+    }
+
+    const hourly = Array.from({ length: 24 }, (_, h) => ({
+      hour: h,
+      entries: hourlyMap[h]?.entries ?? 0,
+      exits: hourlyMap[h]?.exits ?? 0,
+    }));
+
+    res.json({ entries, exits, denied, total: logs.length, hourly });
+  }),
+);
+
+router.get(
   "/",
   asyncHandler(async (req, res) => {
     const company = companyId(req);
     const q = listSchema.parse(req.query);
+
+    const occurredAt: { gte?: Date; lte?: Date } = {};
+    if (q.from) occurredAt.gte = q.from;
+    if (q.to) occurredAt.lte = q.to;
+
     const where = {
       companyId: company,
       ...(q.workerId ? { workerId: q.workerId } : {}),
+      ...(q.workerName
+        ? { worker: { fullName: { contains: q.workerName, mode: "insensitive" as const } } }
+        : {}),
       ...(q.result ? { result: q.result } : {}),
       ...(q.direction ? { direction: q.direction } : {}),
-      ...(q.from ? { occurredAt: { gte: q.from } } : {}),
+      ...(Object.keys(occurredAt).length ? { occurredAt } : {}),
       ...(q.mine ? { operatorId: req.user!.id } : {}),
     };
     const [total, items] = await Promise.all([
@@ -491,7 +576,14 @@ router.get(
       prisma.accessLog.findMany({
         where,
         include: {
-          worker: { select: { id: true, fullName: true, role: true } },
+          worker: {
+            select: {
+              id: true,
+              fullName: true,
+              role: true,
+              contractor: { select: { id: true, name: true } },
+            },
+          },
         },
         orderBy: { occurredAt: "desc" },
         skip: (q.page - 1) * q.pageSize,

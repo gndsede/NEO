@@ -1,22 +1,23 @@
 import { Router, type Request } from "express";
 import { RequirementCollectionStatus } from "@prisma/client";
+import type { EffectiveRequirementStatus } from "@prisma/client";
 import { prisma } from "../../lib/prisma.js";
 import { asyncHandler } from "../../middleware/async-handler.js";
 import { authenticate } from "../../middleware/auth.js";
-import { Unauthorized } from "../../lib/errors.js";
 import {
   contractorScopeWhere,
   scopeFromRequest,
   workerScopeWhere,
 } from "../../lib/scope.js";
+import {
+  reportAccess,
+  reportCompliance,
+  reportContractorPending,
+  reportWorkers,
+} from "./report.export.js";
 
 const router = Router();
 router.use(authenticate);
-
-function companyId(req: Request): string {
-  if (!req.user) throw Unauthorized();
-  return req.user.companyId;
-}
 
 function emptyStatus() {
   return {
@@ -158,6 +159,92 @@ router.get(
       requirementStatus: totals,
       chart: statusToChart(totals),
     });
+  }),
+);
+
+// ---------------------------------------------------------------------------
+// Exportação: GET /reports/export/:tipo?format=xlsx|pdf
+// ---------------------------------------------------------------------------
+
+function parseFormat(req: Request): "xlsx" | "pdf" {
+  const f = String(req.query.format ?? "xlsx").toLowerCase();
+  return f === "pdf" ? "pdf" : "xlsx";
+}
+
+const VALID_ES = new Set([
+  "EM_FALTA", "AGUARDANDO", "REPROVADO", "VIGENTE", "PROX_VENCIMENTO", "VENCIDO", "NA",
+]);
+
+function parseEffectiveStatus(raw: unknown): EffectiveRequirementStatus[] | undefined {
+  if (!raw) return undefined;
+  const arr = Array.isArray(raw) ? raw : String(raw).split(",");
+  const valid = arr.map((v) => String(v).trim()).filter((v) => VALID_ES.has(v));
+  return valid.length ? (valid as EffectiveRequirementStatus[]) : undefined;
+}
+
+router.get(
+  "/export/workers",
+  asyncHandler(async (req, res) => {
+    const scope = scopeFromRequest(req);
+    await reportWorkers(
+      scope,
+      {
+        contractorId: req.query.contractorId ? String(req.query.contractorId) : undefined,
+        status: req.query.status ? String(req.query.status) : undefined,
+      },
+      parseFormat(req),
+      res,
+    );
+  }),
+);
+
+router.get(
+  "/export/compliance",
+  asyncHandler(async (req, res) => {
+    const scope = scopeFromRequest(req);
+    await reportCompliance(
+      scope,
+      {
+        contractorId: req.query.contractorId ? String(req.query.contractorId) : undefined,
+        effectiveStatus: parseEffectiveStatus(req.query.effectiveStatus),
+      },
+      parseFormat(req),
+      res,
+    );
+  }),
+);
+
+router.get(
+  "/export/access",
+  asyncHandler(async (req, res) => {
+    const scope = scopeFromRequest(req);
+    const from = req.query.from ? new Date(String(req.query.from)) : undefined;
+    const to = req.query.to ? new Date(String(req.query.to)) : undefined;
+    await reportAccess(
+      scope,
+      {
+        from: from && !Number.isNaN(from.getTime()) ? from : undefined,
+        to: to && !Number.isNaN(to.getTime()) ? to : undefined,
+        obraId: req.query.obraId ? String(req.query.obraId) : undefined,
+      },
+      parseFormat(req),
+      res,
+    );
+  }),
+);
+
+router.get(
+  "/export/contractor-pending",
+  asyncHandler(async (req, res) => {
+    const scope = scopeFromRequest(req);
+    await reportContractorPending(
+      scope,
+      {
+        obraId: req.query.obraId ? String(req.query.obraId) : undefined,
+      },
+      parseFormat(req),
+      res,
+    );
   }),
 );
 

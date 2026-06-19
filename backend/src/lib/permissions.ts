@@ -23,6 +23,9 @@ export const PERMISSION_CATALOG = [
   { group: "Catraca", key: "catraca.manage", label: "Registrar acessos manualmente" },
   { group: "Usuários", key: "usuarios.view", label: "Visualizar usuários" },
   { group: "Usuários", key: "usuarios.manage", label: "Cadastrar e editar usuários" },
+  { group: "RDO", key: "rdo.view", label: "Visualizar RDOs" },
+  { group: "RDO", key: "rdo.manage", label: "Criar e editar RDOs" },
+  { group: "RDO", key: "rdo.approve", label: "Aprovar e reprovar RDOs" },
 ] as const;
 
 export type PermissionKey = (typeof PERMISSION_CATALOG)[number]["key"];
@@ -60,6 +63,7 @@ const LEGACY_MODULE_MAP: Record<
   cracha: { view: "cracha.view", edit: "cracha.generate", delete: "cracha.generate" },
   catraca: { view: "catraca.view", edit: "catraca.manage", delete: "catraca.manage" },
   usuarios: { view: "usuarios.view", edit: "usuarios.manage", delete: "usuarios.manage" },
+  rdo: { view: "rdo.view", edit: "rdo.manage", delete: "rdo.approve" },
 };
 
 function fromLegacyMap(input: Record<string, { view?: boolean; edit?: boolean; delete?: boolean }>): PermissionList {
@@ -138,4 +142,5 @@ export const SIDEBAR_PERMISSION_MAP: Record<string, PermissionKey[]> = {
   cracha: ["cracha.view", "cracha.generate"],
   catraca: ["catraca.view", "catraca.manage"],
   usuarios: ["usuarios.view", "usuarios.manage"],
+  rdo: ["rdo.view", "rdo.manage", "rdo.approve"],
 };

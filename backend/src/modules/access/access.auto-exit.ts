@@ -1,24 +1,63 @@
 import { AccessDirection, AccessResult } from "@prisma/client";
 import { prisma } from "../../lib/prisma.js";
 
-const ENTRY_MAX_AGE_MS = 8 * 60 * 60 * 1000; // 8 horas
-const CHECK_INTERVAL_MS = 15 * 60 * 1000; // a cada 15 min
+/** Fallback quando o colaborador não tem turno cadastrado. */
+const FALLBACK_MAX_AGE_MS = 8 * 60 * 60 * 1000; // 8 horas
+const CHECK_INTERVAL_MS = 15 * 60 * 1000; // 15 min
+
+const SHIFT_TIME_RE = /^([01]\d|2[0-3]):([0-5]\d)$/;
+
+interface ShiftLike {
+  shiftStart: string | null;
+  shiftEnd: string | null;
+}
 
 /**
- * Para cada ENTRY GRANTED sem EXIT posterior do mesmo worker e com mais de
- * 8 horas, insere um EXIT automático no instante do limite (entrada + 8h).
+ * Instante em que a saída automática deve ser registrada a partir do ENTRY.
+ *
+ * - Com `shiftEnd`: aplica esse horário no dia do ENTRY (ou no seguinte, se for
+ *   turno noturno — i.e. shiftEnd < shiftStart). Se o instante calculado ficar
+ *   antes do ENTRY (ex.: ENTRY 23:00 e shiftEnd 22:00 sem shiftStart), soma 24h.
+ * - Sem `shiftEnd`: ENTRY + 8h (compatibilidade).
+ */
+export function autoExitInstant(entryAt: Date, worker: ShiftLike): Date {
+  const end = worker.shiftEnd;
+  if (!end || !SHIFT_TIME_RE.test(end)) {
+    return new Date(entryAt.getTime() + FALLBACK_MAX_AGE_MS);
+  }
+  const [, endHh, endMm] = end.match(SHIFT_TIME_RE)!;
+  const target = new Date(entryAt);
+  target.setHours(Number(endHh), Number(endMm), 0, 0);
+
+  const start = worker.shiftStart;
+  const overnight =
+    !!start && SHIFT_TIME_RE.test(start) && compareHHMM(end, start) < 0;
+
+  if (overnight || target.getTime() <= entryAt.getTime()) {
+    target.setDate(target.getDate() + 1);
+  }
+  return target;
+}
+
+function compareHHMM(a: string, b: string): number {
+  return a.localeCompare(b);
+}
+
+/**
+ * Para cada ENTRY GRANTED sem EXIT posterior, registra um EXIT automático
+ * no instante de término do turno (ou ENTRY + 8h, no fallback).
  * Útil quando o porteiro esquece de registrar a saída.
  */
 export async function runAutoExitOnce(now: Date = new Date()): Promise<number> {
-  const cutoff = new Date(now.getTime() - ENTRY_MAX_AGE_MS);
+  // Lookback amplo: cobre turnos noturnos e fallback. 36h dá margem de sobra
+  // para turnos cuja saída prevista é no dia seguinte.
+  const lookbackCutoff = new Date(now.getTime() - 36 * 60 * 60 * 1000);
 
-  // Pega entradas com mais de 8h. Para cada uma, vamos verificar se já existe
-  // um EXIT posterior do mesmo worker (manual ou automático).
   const candidates = await prisma.accessLog.findMany({
     where: {
       direction: AccessDirection.ENTRY,
       result: AccessResult.GRANTED,
-      occurredAt: { lte: cutoff },
+      occurredAt: { gte: lookbackCutoff, lte: now },
       workerId: { not: null },
     },
     select: {
@@ -27,6 +66,7 @@ export async function runAutoExitOnce(now: Date = new Date()): Promise<number> {
       workerId: true,
       occurredAt: true,
       gate: true,
+      worker: { select: { shiftStart: true, shiftEnd: true } },
     },
     orderBy: { occurredAt: "desc" },
     take: 500,
@@ -35,7 +75,11 @@ export async function runAutoExitOnce(now: Date = new Date()): Promise<number> {
   let inserted = 0;
 
   for (const entry of candidates) {
-    if (!entry.workerId) continue;
+    if (!entry.workerId || !entry.worker) continue;
+
+    const exitAt = autoExitInstant(entry.occurredAt, entry.worker);
+    // Ainda não chegou a hora do auto-exit para esta entrada.
+    if (exitAt.getTime() > now.getTime()) continue;
 
     const laterLog = await prisma.accessLog.findFirst({
       where: {
@@ -52,7 +96,9 @@ export async function runAutoExitOnce(now: Date = new Date()): Promise<number> {
     // - Se for ENTRY, alguém já abriu nova sessão (o estado virou par).
     if (laterLog) continue;
 
-    const autoExitAt = new Date(entry.occurredAt.getTime() + ENTRY_MAX_AGE_MS);
+    const reason = entry.worker.shiftEnd
+      ? `Saída automática no fim do turno (${entry.worker.shiftEnd}).`
+      : "Saída automática após 8h sem registro manual";
 
     await prisma.accessLog.create({
       data: {
@@ -63,8 +109,8 @@ export async function runAutoExitOnce(now: Date = new Date()): Promise<number> {
         gate: entry.gate,
         qrHash: null,
         operatorId: null,
-        occurredAt: autoExitAt,
-        reason: "Saída automática após 8h sem registro manual",
+        occurredAt: exitAt,
+        reason,
       },
     });
     inserted++;

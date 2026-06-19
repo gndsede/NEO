@@ -4,6 +4,7 @@ import {
   addManualWorkerRequirementSchema,
   createWorkerSchema,
   importWorkersSchema,
+  listAllRequirementsQuerySchema,
   listWorkersQuerySchema,
   setWorkerRequirementApplicabilitySchema,
   updateWorkerSchema,
@@ -87,6 +88,14 @@ export const workerController = {
     const data = updateWorkerSchema.parse(req.body);
     const worker = await workerService.update(scope, String(req.params.id), data);
     res.json(withAccessToken(worker));
+  },
+
+  /** GET /workers/requirements — lista todas as exigências (aba Pendentes) */
+  async listAllRequirements(req: Request, res: Response) {
+    const scope = scopeFromRequest(req);
+    const query = listAllRequirementsQuerySchema.parse(req.query);
+    const result = await workerService.listAllRequirements(scope, query);
+    res.json(result);
   },
 
   /** GET /workers/requirements-summary — contadores do funil por situação */

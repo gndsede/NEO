@@ -21,6 +21,7 @@ import {
   type AddManualWorkerRequirementInput,
   type CreateWorkerInput,
   type DocumentMeta,
+  type ListAllRequirementsQuery,
   type ListWorkersQuery,
   type SetWorkerRequirementApplicabilityInput,
   type UpdateWorkerInput,
@@ -39,6 +40,158 @@ interface CreateWorkerParams {
   photo?: UploadedFile;
   documents?: UploadedFile[];
   createdById?: string;
+}
+
+/**
+ * Classifica o turno do colaborador para o filtro da listagem.
+ * - NONE: turno não cadastrado em pelo menos uma ponta.
+ * - DAY: shiftStart <= shiftEnd (turno cabe num único dia).
+ * - NIGHT: shiftStart > shiftEnd (entra num dia, sai no seguinte).
+ */
+function matchesShift(
+  shiftStart: string | null,
+  shiftEnd: string | null,
+  filter: "DAY" | "NIGHT" | "NONE",
+): boolean {
+  if (!shiftStart || !shiftEnd) return filter === "NONE";
+  const isNight = shiftStart > shiftEnd;
+  return filter === "NIGHT" ? isNight : filter === "DAY" ? !isNight : false;
+}
+
+function tokenize(raw: string): string[] {
+  return raw.trim().split(/\s+/).filter((t) => t.length > 0);
+}
+
+/**
+ * Pré-filtra IDs de workers que casam com a busca textual usando `unaccent`
+ * do Postgres — busca parcial, em qualquer ordem, insensível a acento e
+ * maiúsculas. Cada token vira um `AND ... ILIKE ...` no campo escolhido.
+ *
+ * Ex.: name="jose silva" pega "José da Silva Pereira".
+ */
+async function workerIdsMatchingText(params: {
+  scopeWhere: { companyId: string; obraId?: unknown };
+  filters: Array<{ field: "fullName" | "rg" | "registration" | "email"; raw: string }>;
+}): Promise<string[]> {
+  const { scopeWhere, filters } = params;
+  const conditions: string[] = [];
+  const values: string[] = [];
+  let i = 1;
+
+  for (const { field, raw } of filters) {
+    for (const t of tokenize(raw)) {
+      conditions.push(
+        `unaccent(lower("${field}")) LIKE unaccent(lower($${i}))`,
+      );
+      values.push(`%${t}%`);
+      i += 1;
+    }
+  }
+
+  if (conditions.length === 0) return [];
+
+  const companyParam = `$${i}`;
+  values.push(scopeWhere.companyId);
+  i += 1;
+
+  let obraClause = "";
+  // Filtro de obra do scope (uma única obra ou lista).
+  if (scopeWhere.obraId && typeof scopeWhere.obraId === "string") {
+    obraClause = ` AND "obraId" = $${i}`;
+    values.push(scopeWhere.obraId);
+    i += 1;
+  } else if (
+    scopeWhere.obraId &&
+    typeof scopeWhere.obraId === "object" &&
+    "in" in scopeWhere.obraId &&
+    Array.isArray((scopeWhere.obraId as { in: unknown[] }).in)
+  ) {
+    const ids = (scopeWhere.obraId as { in: string[] }).in;
+    if (ids.length === 0) return [];
+    const placeholders = ids.map((_, k) => `$${i + k}`).join(",");
+    obraClause = ` AND "obraId" IN (${placeholders})`;
+    values.push(...ids);
+    i += ids.length;
+  }
+
+  const sql = `SELECT id FROM "workers"
+    WHERE "companyId" = ${companyParam}${obraClause}
+      AND ${conditions.join(" AND ")}`;
+
+  const rows = await prisma.$queryRawUnsafe<{ id: string }[]>(sql, ...values);
+  return rows.map((r) => r.id);
+}
+
+/**
+ * Busca global (campo único): cada token precisa aparecer em pelo menos um
+ * de {fullName, registration, qrHash, cpf}. Insensível a acento e caixa.
+ */
+async function workerIdsMatchingGlobal(params: {
+  scopeWhere: { companyId: string; obraId?: unknown };
+  raw: string;
+}): Promise<string[]> {
+  const tokens = tokenize(params.raw);
+  if (tokens.length === 0) return [];
+
+  const values: string[] = [];
+  let i = 1;
+  const perTokenAnds: string[] = [];
+
+  for (const t of tokens) {
+    const tokenOr: string[] = [];
+    tokenOr.push(
+      `unaccent(lower("fullName")) LIKE unaccent(lower($${i}))`,
+    );
+    values.push(`%${t}%`);
+    i += 1;
+
+    tokenOr.push(
+      `unaccent(lower(coalesce("registration", ''))) LIKE unaccent(lower($${i}))`,
+    );
+    values.push(`%${t}%`);
+    i += 1;
+
+    tokenOr.push(`lower("qrHash") LIKE lower($${i})`);
+    values.push(`%${t}%`);
+    i += 1;
+
+    const digits = t.replace(/\D/g, "");
+    if (digits.length > 0) {
+      tokenOr.push(`"cpf" LIKE $${i}`);
+      values.push(`%${digits}%`);
+      i += 1;
+    }
+    perTokenAnds.push(`(${tokenOr.join(" OR ")})`);
+  }
+
+  const companyParam = `$${i}`;
+  values.push(params.scopeWhere.companyId);
+  i += 1;
+
+  let obraClause = "";
+  if (params.scopeWhere.obraId && typeof params.scopeWhere.obraId === "string") {
+    obraClause = ` AND "obraId" = $${i}`;
+    values.push(params.scopeWhere.obraId);
+    i += 1;
+  } else if (
+    params.scopeWhere.obraId &&
+    typeof params.scopeWhere.obraId === "object" &&
+    "in" in params.scopeWhere.obraId &&
+    Array.isArray((params.scopeWhere.obraId as { in: unknown[] }).in)
+  ) {
+    const ids = (params.scopeWhere.obraId as { in: string[] }).in;
+    if (ids.length === 0) return [];
+    const placeholders = ids.map((_, k) => `$${i + k}`).join(",");
+    obraClause = ` AND "obraId" IN (${placeholders})`;
+    values.push(...ids);
+    i += ids.length;
+  }
+
+  const sql = `SELECT id FROM "workers"
+    WHERE "companyId" = ${companyParam}${obraClause}
+      AND ${perTokenAnds.join(" AND ")}`;
+  const rows = await prisma.$queryRawUnsafe<{ id: string }[]>(sql, ...values);
+  return rows.map((r) => r.id);
 }
 
 export class WorkerService {
@@ -195,6 +348,8 @@ export class WorkerService {
           phone: data.phone,
           role: data.role,
           registration: data.registration,
+          shiftStart: data.shiftStart,
+          shiftEnd: data.shiftEnd,
           photoUrl,
           qrHash,
         },
@@ -329,8 +484,10 @@ export class WorkerService {
             phone: data.phone,
             role: data.role,
             registration: data.registration,
+            shiftStart: undefined,
+            shiftEnd: undefined,
             documentsMeta: [],
-          } as CreateWorkerInput,
+          },
         });
         created += 1;
         results.push({ line, status: "created", fullName: data.fullName });
@@ -363,18 +520,84 @@ export class WorkerService {
   }
 
   async list(scope: AuthScope, query: ListWorkersQuery) {
+    const cpfDigits = query.cpf?.replace(/\D/g, "") || undefined;
+    const baseScope = workerScopeWhere(scope);
+
+    // Pré-filtra IDs por texto (nome/RG/matrícula/email) usando unaccent.
+    const textFilters: Array<{ field: "fullName" | "rg" | "registration" | "email"; raw: string }> = [];
+    if (query.name) textFilters.push({ field: "fullName", raw: query.name });
+    if (query.rg) textFilters.push({ field: "rg", raw: query.rg });
+    if (query.registration)
+      textFilters.push({ field: "registration", raw: query.registration });
+    if (query.email) textFilters.push({ field: "email", raw: query.email });
+
+    let textIds: string[] | null = null;
+    if (textFilters.length > 0) {
+      textIds = await workerIdsMatchingText({
+        scopeWhere: {
+          companyId: scope.companyId,
+          obraId: (baseScope as { obraId?: unknown }).obraId,
+        },
+        filters: textFilters,
+      });
+      if (textIds.length === 0) {
+        return {
+          items: [],
+          pagination: { page: query.page, pageSize: query.pageSize, total: 0, totalPages: 0 },
+        };
+      }
+    }
+
+    // Busca global (campo único): pré-filtra IDs por OR sobre nome/matrícula/QR
+    // e mais um EQUAL no CPF/dígitos.
+    if (query.search) {
+      const globalIds = await workerIdsMatchingGlobal({
+        scopeWhere: {
+          companyId: scope.companyId,
+          obraId: (baseScope as { obraId?: unknown }).obraId,
+        },
+        raw: query.search,
+      });
+      if (globalIds.length === 0) {
+        return {
+          items: [],
+          pagination: { page: query.page, pageSize: query.pageSize, total: 0, totalPages: 0 },
+        };
+      }
+      textIds =
+        textIds === null
+          ? globalIds
+          : textIds.filter((id) => globalIds.includes(id));
+      if (textIds.length === 0) {
+        return {
+          items: [],
+          pagination: { page: query.page, pageSize: query.pageSize, total: 0, totalPages: 0 },
+        };
+      }
+    }
+
     const where: Prisma.WorkerWhereInput = {
-      ...workerScopeWhere(scope),
+      ...baseScope,
       ...(query.contractorId ? { contractorId: query.contractorId } : {}),
+      ...(query.functionId ? { functionId: query.functionId } : {}),
       ...(query.status ? { status: query.status } : {}),
-      ...(query.search
+      ...(cpfDigits ? { cpf: { contains: cpfDigits } } : {}),
+      ...(query.hasPhoto === true ? { photoUrl: { not: null } } : {}),
+      ...(query.hasPhoto === false ? { photoUrl: null } : {}),
+      ...(query.createdFrom || query.createdTo
         ? {
-            OR: [
-              { fullName: { contains: query.search, mode: "insensitive" } },
-              { cpf: { contains: query.search.replace(/\D/g, "") } },
-              { registration: { contains: query.search, mode: "insensitive" } },
-              { qrHash: { contains: query.search.toUpperCase(), mode: "insensitive" } },
-            ],
+            createdAt: {
+              ...(query.createdFrom ? { gte: query.createdFrom } : {}),
+              ...(query.createdTo ? { lte: query.createdTo } : {}),
+            },
+          }
+        : {}),
+      ...(textIds !== null ? { id: { in: textIds } } : {}),
+      ...(query.effectiveStatus?.length
+        ? {
+            requirementItems: {
+              some: { effectiveStatus: { in: query.effectiveStatus } },
+            },
           }
         : {}),
     };
@@ -386,6 +609,8 @@ export class WorkerService {
         include: {
           contractor: { select: { id: true, name: true } },
           obra: { select: { id: true, name: true } },
+          // Apenas o status efetivo é necessário no front (chips/filtros).
+          requirementItems: { select: { effectiveStatus: true } },
         },
         orderBy: { createdAt: "desc" },
         skip: (query.page - 1) * query.pageSize,
@@ -393,8 +618,15 @@ export class WorkerService {
       }),
     ]);
 
+    // Filtro de turno é feito em memória — comparar duas colunas string da
+    // mesma linha no Prisma exigiria raw SQL; o pós-filtro é simples e barato
+    // dentro do pageSize (máx. 1000).
+    const filteredItems = query.shift
+      ? items.filter((w) => matchesShift(w.shiftStart, w.shiftEnd, query.shift!))
+      : items;
+
     return {
-      items,
+      items: filteredItems,
       pagination: {
         page: query.page,
         pageSize: query.pageSize,
@@ -414,10 +646,25 @@ export class WorkerService {
       await this.ensureWorkerFunctionBelongsToCompany(companyId, nextFunctionId);
     }
 
+    // Quando o contractorId muda, busca a obra da nova empreiteira para
+    // manter worker.obraId em sincronia (worker pertence à obra do seu contractor).
+    let newObraId: string | undefined;
+    if (data.contractorId && data.contractorId !== existing.contractorId) {
+      const contractor = await prisma.contractor.findFirst({
+        where: { id: data.contractorId, companyId },
+        select: { id: true, obraId: true },
+      });
+      if (!contractor) throw NotFound("Empreiteira não encontrada");
+      newObraId = contractor.obraId;
+    }
+
     const worker = await prisma.$transaction(async (tx) => {
       const updated = await tx.worker.update({
         where: { id },
-        data,
+        data: {
+          ...data,
+          ...(newObraId ? { obraId: newObraId } : {}),
+        },
         include: {
           documents: true,
           contractor: true,
@@ -485,6 +732,72 @@ export class WorkerService {
       counts.EM_FALTA + counts.AGUARDANDO + counts.REPROVADO + counts.VENCIDO;
 
     return { counts, pendentes };
+  }
+
+  /**
+   * Lista todas as exigências de todos os colaboradores no escopo,
+   * com filtros por effectiveStatus, contractorId e workerId.
+   * Alimenta a aba Pendentes do portal.
+   */
+  async listAllRequirements(scope: AuthScope, query: ListAllRequirementsQuery) {
+    const { companyId } = scope;
+    const scopeWhere = workerScopeWhere(scope);
+
+    const where = {
+      companyId,
+      worker: scopeWhere,
+      ...(query.effectiveStatus?.length
+        ? { effectiveStatus: { in: query.effectiveStatus } }
+        : {}),
+      ...(query.contractorId
+        ? { worker: { ...scopeWhere, contractorId: query.contractorId } }
+        : {}),
+      ...(query.workerId ? { workerId: query.workerId } : {}),
+    };
+
+    const [total, items] = await Promise.all([
+      prisma.workerRequirementItem.count({ where }),
+      prisma.workerRequirementItem.findMany({
+        where,
+        include: {
+          worker: {
+            select: {
+              id: true,
+              fullName: true,
+              role: true,
+              contractor: { select: { id: true, name: true } },
+              obra: { select: { id: true, name: true } },
+            },
+          },
+          latestDocument: {
+            select: {
+              id: true,
+              status: true,
+              title: true,
+              type: true,
+              fileUrl: true,
+              issuedAt: true,
+              expiresAt: true,
+              reviewedAt: true,
+              rejectionReason: true,
+            },
+          },
+        },
+        orderBy: [{ effectiveStatus: "asc" }, { updatedAt: "desc" }],
+        skip: (query.page - 1) * query.pageSize,
+        take: query.pageSize,
+      }),
+    ]);
+
+    return {
+      items,
+      pagination: {
+        page: query.page,
+        pageSize: query.pageSize,
+        total,
+        totalPages: Math.ceil(total / query.pageSize),
+      },
+    };
   }
 
   async listRequirements(scope: AuthScope, workerId: string) {

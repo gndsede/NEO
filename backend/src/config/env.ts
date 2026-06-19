@@ -46,6 +46,10 @@ const envSchema = z.object({
   SUPABASE_URL: z.string().optional(),
   SUPABASE_SERVICE_ROLE_KEY: z.string().optional(),
   SUPABASE_BUCKET: z.string().optional(),
+
+  // Email (Resend) — opcional; notificações desabilitadas se ausente
+  RESEND_API_KEY: z.string().optional(),
+  NOTIFICATION_FROM_EMAIL: z.string().default("notificacoes@accesshub.com.br"),
 });
 
 const parsed = envSchema.safeParse(process.env);

@@ -116,6 +116,13 @@ enum AccessResult {
   DENIED
 }
 
+/// Tipo de notificação enviada por email.
+enum NotificationType {
+  DOCUMENT_EXPIRING_7D
+  DOCUMENT_EXPIRED
+  DOCUMENT_REJECTED
+}
+
 // ----------------------------------------------------------------------------
 // Tenancy / Identidade
 // ----------------------------------------------------------------------------
@@ -147,6 +154,8 @@ model Company {
   requirementDefinitions       DocumentRequirementDefinition[]
   workerRequirementItems       WorkerRequirementItem[]
   contractorRequirementItems   ContractorRequirementItem[]
+  notificationLogs             NotificationLog[]
+  rdos                         Rdo[]
 
   @@index([active])
   @@map("companies")
@@ -178,6 +187,8 @@ model User {
   createdWorkerRequirementItems     WorkerRequirementItem[]   @relation("WorkerRequirementCreatedBy")
   createdContractorRequirementItems ContractorRequirementItem[] @relation("ContractorRequirementCreatedBy")
   obraAccess                        UserObraAccess[]
+  createdRdos                       Rdo[]                     @relation("RdoCreatedBy")
+  approvedRdos                      Rdo[]                     @relation("RdoApprovedBy")
 
   @@index([companyId])
   @@index([contractorId])
@@ -195,13 +206,16 @@ model Obra {
   addressLine String?
   city        String?
   state       String?
-  active      Boolean  @default(true)
-  createdAt   DateTime @default(now())
-  updatedAt   DateTime @updatedAt
+  active               Boolean   @default(true)
+  dataInicio           DateTime?
+  dataTerminoPrevisto  DateTime?
+  createdAt            DateTime  @default(now())
+  updatedAt            DateTime  @updatedAt
 
   userAccess  UserObraAccess[]
   contractors Contractor[]
   workers     Worker[]
+  rdos        Rdo[]
 
   @@unique([companyId, code])
   @@index([companyId, active])
@@ -289,6 +303,12 @@ model Worker {
   status         WorkerStatus @default(ACTIVE)
   /// Validade global do acesso (derivada da documentação; cacheável).
   accessValidUntil DateTime?
+
+  /// Turno de trabalho — HH:MM (24h). Usado pela catraca para registrar a
+  /// saída automática no fim do expediente quando ela não é informada manualmente.
+  /// Se shiftEnd < shiftStart, considera-se turno noturno (saída no dia seguinte).
+  shiftStart     String?
+  shiftEnd       String?
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -563,4 +583,105 @@ model AccessLog {
   @@index([companyId, occurredAt])
   @@index([workerId, occurredAt])
   @@map("access_logs")
+}
+
+// ----------------------------------------------------------------------------
+// Notificações
+// ----------------------------------------------------------------------------
+
+// ----------------------------------------------------------------------------
+// RDO — Relatório Diário de Obra
+// ----------------------------------------------------------------------------
+
+enum RdoStatus {
+  PENDENTE            // criado, ainda não enviado para aprovação
+  AGUARDANDO_APROVACAO // enviado, aguardando revisor
+  APROVADO            // aprovado pelo responsável
+  REPROVADO           // reprovado — requer correção e reenvio
+}
+
+/// Relatório Diário de Obra. Arrays dinâmicos (efetivos, equipamentos, etc.)
+/// são persistidos como JSON para manter o schema flat sem N tabelas extras.
+model Rdo {
+  id        String   @id @default(cuid())
+  companyId String
+  company   Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  obraId    String?
+  obra      Obra?    @relation(fields: [obraId], references: [id], onDelete: SetNull)
+
+  // Dados do Empreendimento
+  contratoNumero  String?
+  docNumero       String?
+  data            DateTime
+  turnos          String?
+  jornadaTrabalho String?
+  localidade      String?
+  dataInicio      DateTime?
+  dataTermino     DateTime?
+  diasDecorridos  Int?
+  diasRestantes   Int?
+  diasAtraso      Int?
+  prorrogacao     DateTime?
+
+  // Condições Climáticas
+  climaManha   String?
+  climaTarde   String?
+  climaNoite   String?
+  chuvaQuantMm Float?
+
+  // Arrays JSON: [{ empresa, efetivo }]
+  efetivoIndireta Json @default("[]")
+  efetivoODireta  Json @default("[]")
+
+  // Array JSON: [{ equipamento, quantidade }]
+  equipamentos Json @default("[]")
+
+  // Array JSON: [{ atividadeExecutada, status }]
+  atividades Json @default("[]")
+
+  // Array JSON: [{ fornecedor, material, nfRecebidas }]
+  materiais Json @default("[]")
+
+  // Considerações
+  consideracoesContratada   String?
+  consideracoesFiscalizacao String?
+
+  // Array JSON: [{ fileUrl, fileKey, caption }]
+  fotos Json @default("[]")
+
+  // Array JSON: [{ fileUrl, fileKey, fileName }]
+  arquivos Json @default("[]")
+
+  status          RdoStatus @default(PENDENTE)
+  createdById     String?
+  createdBy       User?     @relation("RdoCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+  approvedById    String?
+  approvedBy      User?     @relation("RdoApprovedBy", fields: [approvedById], references: [id], onDelete: SetNull)
+  approvedAt      DateTime?
+  rejectionReason String?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  @@index([companyId, data])
+  @@index([companyId, status])
+  @@index([obraId])
+  @@map("rdos")
+}
+
+/// Registro de emails enviados — impede reenvio duplicado dentro da janela de dedup.
+model NotificationLog {
+  id             String           @id @default(cuid())
+  companyId      String
+  company        Company          @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  type           NotificationType
+  /// "contractor_digest" | "document"
+  targetType     String
+  /// contractorId (digest agendado) ou documentId (rejeição imediata)
+  targetId       String
+  recipientEmail String
+  sentAt         DateTime         @default(now())
+
+  @@index([targetId, type, sentAt])
+  @@index([companyId, sentAt])
+  @@map("notification_logs")
 }

@@ -11,6 +11,7 @@ import { crachasRoutes } from "./modules/crachas/crachas.routes.js";
 import { obrasRoutes } from "./modules/obras/obras.routes.js";
 import { publicRoutes } from "./modules/public/public.routes.js";
 import { syncRoutes } from "./modules/sync/sync.routes.js";
+import { rdoRoutes } from "./modules/rdo/rdo.routes.js";
 
 export const apiRouter = Router();
 
@@ -30,3 +31,4 @@ apiRouter.use("/users", usersRoutes);
 apiRouter.use("/obras", obrasRoutes);
 apiRouter.use("/crachas", crachasRoutes);
 apiRouter.use("/sync", syncRoutes);
+apiRouter.use("/rdo", rdoRoutes);
