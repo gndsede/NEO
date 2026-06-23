@@ -141,6 +141,7 @@ const scanSchema = z.object({
    */
   direction: z.nativeEnum(AccessDirection).optional(),
   gate: z.string().optional(),
+  override: z.boolean().optional(),
 });
 
 router.post(
@@ -148,7 +149,7 @@ router.post(
   requireCapability("catraca.manage"),
   asyncHandler(async (req, res) => {
     const company = companyId(req);
-    const { qr, direction: requestedDirection, gate } = scanSchema.parse(req.body);
+    const { qr, direction: requestedDirection, gate, override } = scanSchema.parse(req.body);
 
     const token = normalizeScannedQr(qr);
 
@@ -231,7 +232,7 @@ router.post(
       company,
       worker.id,
     );
-    if (pendingRequirements.length > 0) {
+    if (!override && pendingRequirements.length > 0) {
       return deny(
         formatPendingReason(pendingRequirements),
         worker.id,
@@ -240,22 +241,49 @@ router.post(
       );
     }
 
-    if (worker.documents.some((d) => d.status === DocumentStatus.REJEITADO))
+    if (!override && worker.documents.some((d) => d.status === DocumentStatus.REJEITADO))
       return deny("Documentação rejeitada", worker.id, direction);
-    if (worker.accessValidUntil && worker.accessValidUntil < new Date())
+    if (!override && worker.accessValidUntil && worker.accessValidUntil < new Date())
       return deny("Documentação vencida", worker.id, direction);
 
-    const log = await prisma.accessLog.create({
-      data: {
-        companyId: company,
-        workerId: worker.id,
-        direction,
-        result: AccessResult.GRANTED,
-        gate,
-        qrHash: token,
-        operatorId: req.user!.id,
-      },
-    });
+    let log;
+    if (override) {
+      const twoMinsAgo = new Date(Date.now() - 2 * 60 * 1000);
+      const recentDenied = await prisma.accessLog.findFirst({
+        where: {
+          companyId: company,
+          workerId: worker.id,
+          result: AccessResult.DENIED,
+          occurredAt: { gte: twoMinsAgo },
+        },
+        orderBy: { occurredAt: "desc" },
+      });
+      if (recentDenied) {
+        log = await prisma.accessLog.update({
+          where: { id: recentDenied.id },
+          data: {
+            result: AccessResult.GRANTED,
+            reason: "Liberação manual (com pendências)",
+            operatorId: req.user!.id,
+          },
+        });
+      }
+    }
+
+    if (!log) {
+      log = await prisma.accessLog.create({
+        data: {
+          companyId: company,
+          workerId: worker.id,
+          direction,
+          result: AccessResult.GRANTED,
+          reason: override ? "Liberação manual (com pendências)" : null,
+          gate,
+          qrHash: token,
+          operatorId: req.user!.id,
+        },
+      });
+    }
 
     const aso = worker.documents.find(
       (d) => d.type === DocumentType.ASO && d.status === DocumentStatus.APROVADO,
@@ -312,6 +340,7 @@ const batchScanItemSchema = z.object({
   occurredAt: z.string().datetime({ offset: true }).optional(),
   /** ID local gerado pelo app — devolvido na resposta para o app casar com sua fila. */
   clientId: z.string().min(1).max(120).optional(),
+  override: z.boolean().optional(),
 });
 
 const batchScanSchema = z.object({
@@ -442,33 +471,61 @@ router.post(
       }
 
       const batchPending = await fetchPendingRequirements(company, worker.id);
-      if (batchPending.length > 0) {
+      if (!item.override && batchPending.length > 0) {
         await recordDeny(formatPendingReason(batchPending), direction, worker.id);
         continue;
       }
 
-      if (worker.documents.some((d) => d.status === DocumentStatus.REJEITADO)) {
+      if (!item.override && worker.documents.some((d) => d.status === DocumentStatus.REJEITADO)) {
         await recordDeny("Documentação rejeitada", direction, worker.id);
         continue;
       }
-      if (worker.accessValidUntil && worker.accessValidUntil < occurredAt) {
+      if (!item.override && worker.accessValidUntil && worker.accessValidUntil < occurredAt) {
         await recordDeny("Documentação vencida", direction, worker.id);
         continue;
       }
 
-      const log = await createBatchLog({
-        companyId: company,
-        clientId: item.clientId,
-        data: {
-          workerId: worker.id,
-          direction,
-          gate: item.gate,
-          operatorId: req.user!.id,
-          occurredAt,
-          result: AccessResult.GRANTED,
-          qrHash: token,
-        },
-      });
+      let log;
+      if (item.override) {
+        const twoMinsAgo = new Date(occurredAt.getTime() - 2 * 60 * 1000);
+        const recentDenied = await prisma.accessLog.findFirst({
+          where: {
+            companyId: company,
+            workerId: worker.id,
+            result: AccessResult.DENIED,
+            occurredAt: { gte: twoMinsAgo, lte: occurredAt },
+          },
+          orderBy: { occurredAt: "desc" },
+        });
+        if (recentDenied) {
+          log = await prisma.accessLog.update({
+            where: { id: recentDenied.id },
+            data: {
+              result: AccessResult.GRANTED,
+              reason: "Liberação manual (com pendências)",
+              operatorId: req.user!.id,
+              clientId: item.clientId,
+            },
+          });
+        }
+      }
+
+      if (!log) {
+        log = await createBatchLog({
+          companyId: company,
+          clientId: item.clientId,
+          data: {
+            workerId: worker.id,
+            direction,
+            gate: item.gate,
+            operatorId: req.user!.id,
+            occurredAt,
+            result: AccessResult.GRANTED,
+            reason: item.override ? "Liberação manual (com pendências)" : null,
+            qrHash: token,
+          },
+        });
+      }
       results.push({
         clientId: item.clientId ?? null,
         result: log.result === AccessResult.GRANTED ? "GRANTED" : "DENIED",

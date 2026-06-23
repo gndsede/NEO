@@ -16,7 +16,11 @@ export function createApp() {
       ? []
       : env.CORS_ORIGIN.split(",").map((o) => o.trim()).filter(Boolean);
 
-  app.use(helmet());
+  app.use(
+    helmet({
+      crossOriginResourcePolicy: { policy: "cross-origin" },
+    }),
+  );
   app.use(
     cors({
       origin(origin, callback) {
