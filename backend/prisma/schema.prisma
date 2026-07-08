@@ -23,7 +23,7 @@ enum UserProfile {
   COLLABORATOR
 }
 
-/// Situação de um colaborador na obra.
+/// Situação de um colaborador no vínculo com a obra (WorkerAssignment).
 enum WorkerStatus {
   ACTIVE
   INACTIVE
@@ -36,17 +36,12 @@ enum DocumentOwnerType {
   CONTRACTOR
 }
 
-/// Tipos de documento mais comuns no contexto de obra/SST.
+/// Classificação do documento: de segurança do trabalho (ASO, NRs, EPI...) ou
+/// padrão/administrativo (identificação, contrato, etc.). O tipo específico
+/// do documento é descrito pelo campo `name` do registro/documento.
 enum DocumentType {
-  ASO // Atestado de Saúde Ocupacional
-  NR_35 // Trabalho em altura
-  NR_10 // Eletricidade
-  NR_18 // Construção civil
-  EPI // Ficha de entrega de EPI
-  RG_CPF // Cópia de documento de identificação
-  CONTRATO // Contrato / vínculo da empreiteira
-  CNPJ // Documentos da empresa empreiteira
-  OUTRO
+  SAFETY // Documento de segurança do trabalho
+  STANDARD // Documento padrão/administrativo
 }
 
 /// Status do workflow de aprovação documental.
@@ -58,8 +53,25 @@ enum DocumentStatus {
 
 /// Frequência de cobrança do registro documental.
 enum RequirementFrequency {
-  MONTHLY
   ONE_TIME
+  BY_EXPIRY
+  DAILY
+  WEEKLY
+  BIWEEKLY
+  MONTHLY
+  BIMONTHLY
+  QUARTERLY
+  FOUR_MONTHLY
+  SEMIANNUAL
+  ANNUAL
+}
+
+/// Define se o envio do documento pede a competência (período de referência,
+/// ex.: "mês/ano a que o ASO se refere").
+enum CompetenceMode {
+  NONE
+  ALLOWED
+  REQUIRED
 }
 
 /// Alvo da regra de documentação.
@@ -140,6 +152,14 @@ model Company {
   city         String?
   state        String?
   active       Boolean  @default(true)
+
+  // Campos de gestão SaaS (gerenciados pelo super-admin)
+  plan             String    @default("STARTER") // STARTER | PROFISSIONAL | ENTERPRISE
+  blocked          Boolean   @default(false)
+  licenseExpiresAt DateTime?
+  workerLimit      Int?
+  accessToken      String?   @unique // Token de API gerado para integrações
+
   createdAt    DateTime @default(now())
   updatedAt    DateTime @updatedAt
 
@@ -147,6 +167,7 @@ model Company {
   obras       Obra[]
   contractors Contractor[]
   workers     Worker[]
+  workerAssignments            WorkerAssignment[]
   documents   Document[]
   accessLogs  AccessLog[]
   workerFunctions              WorkerFunction[]
@@ -156,6 +177,10 @@ model Company {
   contractorRequirementItems   ContractorRequirementItem[]
   notificationLogs             NotificationLog[]
   rdos                         Rdo[]
+  userGroups                   UserGroup[]
+  saContracts                  SaContract[]
+  saInvoices                   SaInvoice[]
+  supportTickets               SupportTicket[]
 
   @@index([active])
   @@map("companies")
@@ -175,6 +200,9 @@ model User {
   /// Lista de permissões (chaves de ação) concedidas ao usuário.
   permissions  Json?
   active       Boolean  @default(true)
+  /// Segredo TOTP (base32) para autenticação de dois fatores via Google Authenticator.
+  totpSecret   String?
+  totpEnabled  Boolean  @default(false)
   createdAt    DateTime @default(now())
   updatedAt    DateTime @updatedAt
 
@@ -189,6 +217,8 @@ model User {
   obraAccess                        UserObraAccess[]
   createdRdos                       Rdo[]                     @relation("RdoCreatedBy")
   approvedRdos                      Rdo[]                     @relation("RdoApprovedBy")
+  groupMemberships                  UserGroupMember[]
+  requirementDefinitionAccess       RequirementDefinitionUserAccess[]
 
   @@index([companyId])
   @@index([contractorId])
@@ -212,10 +242,10 @@ model Obra {
   createdAt            DateTime  @default(now())
   updatedAt            DateTime  @updatedAt
 
-  userAccess  UserObraAccess[]
-  contractors Contractor[]
-  workers     Worker[]
-  rdos        Rdo[]
+  userAccess        UserObraAccess[]
+  contractors       Contractor[]
+  workerAssignments WorkerAssignment[]
+  rdos              Rdo[]
 
   @@unique([companyId, code])
   @@index([companyId, active])
@@ -258,10 +288,10 @@ model Contractor {
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
 
-  workers   Worker[]
-  documents Document[]
-  requirementItems ContractorRequirementItem[]
-  linkedUsers      User[]                      @relation("UserContractor")
+  workerAssignments WorkerAssignment[]
+  documents         Document[]
+  requirementItems  ContractorRequirementItem[]
+  linkedUsers       User[]                      @relation("UserContractor")
 
   @@unique([obraId, cnpj])
   @@index([companyId])
@@ -271,58 +301,90 @@ model Contractor {
 }
 
 // ----------------------------------------------------------------------------
-// Colaborador (Worker)
+// Colaborador (Worker + WorkerAssignment)
 // ----------------------------------------------------------------------------
 
-/// Colaborador (terceiro) que acessa a obra. Pertence a uma empreiteira e a uma obra.
+/// Identidade pessoal do colaborador — compartilhada entre todas as obras.
+/// Dados que mudam por obra (função, turno, status, empreiteira) ficam em WorkerAssignment.
 model Worker {
-  id           String       @id @default(cuid())
-  companyId    String
-  company      Company      @relation(fields: [companyId], references: [id], onDelete: Cascade)
-  obraId       String
-  obra         Obra         @relation(fields: [obraId], references: [id], onDelete: Cascade)
-  contractorId String
-  contractor   Contractor   @relation(fields: [contractorId], references: [id], onDelete: Restrict)
-  functionId   String?
-  function     WorkerFunction? @relation(fields: [functionId], references: [id], onDelete: SetNull)
+  id        String  @id @default(cuid())
+  companyId String
+  company   Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
 
-  // Dados pessoais
-  fullName       String
-  cpf            String
-  rg             String?
-  birthDate      DateTime?
-  email          String?
-  phone          String?
-  role           String // Função (ex.: "Pedreiro", "Eletricista")
-  registration   String? // Matrícula (ex.: "CLB-00482")
-  photoUrl       String? // Foto do colaborador (storage)
+  // Dados pessoais — comuns a todas as obras
+  fullName  String
+  /// CPF armazenado em texto plano ou criptografado com AES-256-GCM (quando ENCRYPTION_KEY está definida).
+  /// Use cpfHash para buscas exatas e verificação de unicidade.
+  cpf       String
+  /// Hash determinístico do CPF (HMAC-SHA256 ou SHA256 sem chave).
+  /// Permite verificar unicidade sem expor o número do documento.
+  cpfHash   String
+  /// RG armazenado criptografado com AES-256-GCM quando ENCRYPTION_KEY está definida.
+  rg        String?
+  birthDate DateTime?
+  email     String?
+  phone     String?
+  photoUrl  String?
 
-  // Identificação de crachá / acesso
   /// Token único do crachá (padrão NEO-0A0AA0) — conteúdo do QR Code.
-  qrHash         String       @unique
-  status         WorkerStatus @default(ACTIVE)
-  /// Validade global do acesso (derivada da documentação; cacheável).
-  accessValidUntil DateTime?
+  /// Um único crachá funciona em todas as obras onde o colaborador está vinculado.
+  qrHash    String @unique
 
-  /// Turno de trabalho — HH:MM (24h). Usado pela catraca para registrar a
-  /// saída automática no fim do expediente quando ela não é informada manualmente.
-  /// Se shiftEnd < shiftStart, considera-se turno noturno (saída no dia seguinte).
-  shiftStart     String?
-  shiftEnd       String?
+  /// Preenchido quando o titular exerceu o direito de apagamento (LGPD Art. 18).
+  /// Os campos de PII são substituídos por valores anônimos; logs de acesso são preservados.
+  anonymizedAt DateTime?
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  documents  Document[]
-  accessLogs AccessLog[]
+  assignments      WorkerAssignment[]
+  documents        Document[]
+  accessLogs       AccessLog[]
   requirementItems WorkerRequirementItem[]
 
-  @@unique([obraId, cpf])
-  @@index([contractorId])
-  @@index([obraId])
-  @@index([functionId])
-  @@index([companyId, status])
+  @@unique([companyId, cpfHash])
+  @@index([companyId])
   @@map("workers")
+}
+
+/// Vínculo do colaborador com uma obra específica.
+/// Um colaborador pode ter N vínculos (um por obra), cada um com seus próprios
+/// requisitos, status, turno e empreiteira.
+model WorkerAssignment {
+  id           String   @id @default(cuid())
+  companyId    String
+  company      Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  workerId     String
+  worker       Worker   @relation(fields: [workerId], references: [id], onDelete: Cascade)
+  obraId       String
+  obra         Obra     @relation(fields: [obraId], references: [id], onDelete: Cascade)
+  contractorId String
+  contractor   Contractor @relation(fields: [contractorId], references: [id], onDelete: Restrict)
+  functionId   String?
+  function     WorkerFunction? @relation(fields: [functionId], references: [id], onDelete: SetNull)
+
+  /// Função descritiva nesta obra (ex.: "Pedreiro", "Eletricista").
+  role         String
+  registration String?  // Matrícula específica desta obra
+  /// Data de início do colaborador nesta obra — referência para coleta periódica.
+  admissionDate DateTime?
+  shiftStart   String?
+  shiftEnd     String?
+  status       WorkerStatus @default(ACTIVE)
+  /// Validade do acesso nesta obra (derivada dos requisitos; cacheável).
+  accessValidUntil DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  requirementItems WorkerRequirementItem[]
+
+  @@unique([obraId, workerId])
+  @@index([workerId])
+  @@index([obraId])
+  @@index([contractorId])
+  @@index([companyId, status])
+  @@map("worker_assignments")
 }
 
 // ----------------------------------------------------------------------------
@@ -337,10 +399,23 @@ model DocumentRequirementDefinition {
   company       Company              @relation(fields: [companyId], references: [id], onDelete: Cascade)
   target        RequirementTarget
   name          String
+  description   String?
   documentType  DocumentType
   frequency     RequirementFrequency
   monthlyDueDay Int?
   referenceDate DateTime?
+
+  /// Formatos de arquivo aceitos no anexo (texto livre, ex.: "PDF, JPG"). Vazio = qualquer formato.
+  attachmentFormats     String?
+  /// Se o anexo é obrigatório para considerar o registro atendido.
+  attachmentRequired    Boolean        @default(true)
+  /// Se o envio pede/obriga informar a competência (período de referência).
+  competenceMode        CompetenceMode @default(NONE)
+  /// Instruções/observações exibidas a quem for anexar o documento.
+  observations          String?
+  /// Se, quando pendente, este registro bloqueia a liberação na catraca virtual.
+  grantsTurnstileAccess Boolean        @default(false)
+
   active        Boolean              @default(true)
   createdAt     DateTime             @default(now())
   updatedAt     DateTime             @updatedAt
@@ -349,10 +424,72 @@ model DocumentRequirementDefinition {
   contractorTypeRequirements   ContractorTypeRequirement[]
   workerRequirementItems       WorkerRequirementItem[]
   contractorRequirementItems   ContractorRequirementItem[]
+  groupAccess                  RequirementDefinitionGroupAccess[]
+  userAccess                   RequirementDefinitionUserAccess[]
 
   @@index([companyId, target, active])
   @@index([companyId, documentType])
   @@map("document_requirement_definitions")
+}
+
+/// Grupo de usuários (equipe/departamento), usado para conceder acesso a
+/// registros documentais específicos de forma coletiva.
+model UserGroup {
+  id          String   @id @default(cuid())
+  companyId   String
+  company     Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  name        String
+  description String?
+  active      Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  members           UserGroupMember[]
+  requirementAccess RequirementDefinitionGroupAccess[]
+
+  @@unique([companyId, name])
+  @@index([companyId, active])
+  @@map("user_groups")
+}
+
+/// Associação N:N entre grupo e usuário.
+model UserGroupMember {
+  id        String    @id @default(cuid())
+  groupId   String
+  group     UserGroup @relation(fields: [groupId], references: [id], onDelete: Cascade)
+  userId    String
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  createdAt DateTime  @default(now())
+
+  @@unique([groupId, userId])
+  @@index([userId])
+  @@map("user_group_members")
+}
+
+/// Concede acesso de um grupo de usuários a um registro documental específico.
+model RequirementDefinitionGroupAccess {
+  id            String                         @id @default(cuid())
+  requirementId String
+  requirement   DocumentRequirementDefinition  @relation(fields: [requirementId], references: [id], onDelete: Cascade)
+  groupId       String
+  group         UserGroup                      @relation(fields: [groupId], references: [id], onDelete: Cascade)
+  createdAt     DateTime                       @default(now())
+
+  @@unique([requirementId, groupId])
+  @@map("requirement_definition_group_access")
+}
+
+/// Concede acesso de um usuário específico a um registro documental específico.
+model RequirementDefinitionUserAccess {
+  id            String                         @id @default(cuid())
+  requirementId String
+  requirement   DocumentRequirementDefinition  @relation(fields: [requirementId], references: [id], onDelete: Cascade)
+  userId        String
+  user          User                           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  createdAt     DateTime                       @default(now())
+
+  @@unique([requirementId, userId])
+  @@map("requirement_definition_user_access")
 }
 
 /// Catálogo de funções de colaborador (Pedreiro, Eletricista, etc.).
@@ -366,7 +503,7 @@ model WorkerFunction {
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
 
-  workers       Worker[]
+  assignments   WorkerAssignment[]
   requirements  WorkerFunctionRequirement[]
 
   @@unique([companyId, name])
@@ -420,12 +557,16 @@ model ContractorTypeRequirement {
 }
 
 /// Exigência documental em nível de colaborador (coleta operacional).
+/// Scoped ao vínculo (WorkerAssignment) — cada obra tem seus próprios itens.
 model WorkerRequirementItem {
   id             String                     @id @default(cuid())
   companyId      String
   company        Company                    @relation(fields: [companyId], references: [id], onDelete: Cascade)
   workerId       String
   worker         Worker                     @relation(fields: [workerId], references: [id], onDelete: Cascade)
+  /// Vínculo específico (obra) ao qual esta exigência pertence.
+  assignmentId   String?
+  assignment     WorkerAssignment?          @relation(fields: [assignmentId], references: [id], onDelete: Cascade)
   requirementId  String?
   requirement    DocumentRequirementDefinition? @relation(fields: [requirementId], references: [id], onDelete: SetNull)
   source         RequirementSource
@@ -458,6 +599,7 @@ model WorkerRequirementItem {
 
   @@index([companyId, workerId, status])
   @@index([requirementId])
+  @@index([assignmentId])
   @@index([companyId, effectiveStatus]) // funil por situação
   @@index([companyId, dueDate]) // ordenar por deadline
   @@index([workerId, effectiveStatus]) // chips por colaborador
@@ -666,6 +808,100 @@ model Rdo {
   @@index([companyId, status])
   @@index([obraId])
   @@map("rdos")
+}
+
+// ----------------------------------------------------------------------------
+// Super-Admin — sistema paralelo ao tenant, gerencia o SaaS
+// ----------------------------------------------------------------------------
+
+/// Administrador da plataforma NEO (nível acima dos tenants).
+model SuperAdmin {
+  id           String   @id @default(cuid())
+  email        String   @unique
+  passwordHash String
+  name         String
+  totpSecret   String?
+  totpEnabled  Boolean  @default(false)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  @@map("super_admins")
+}
+
+/// Contrato de licenciamento entre NEO e um tenant.
+model SaContract {
+  id             String    @id @default(cuid())
+  companyId      String?
+  company        Company?  @relation(fields: [companyId], references: [id], onDelete: SetNull)
+  tenantName     String
+  tenantCnpj     String?
+  plan           String
+  monthlyValue   Float
+  contractMonths Int
+  startDate      DateTime
+  endDate        DateTime
+  status         String    @default("DRAFT") // DRAFT | SENT | SIGNED | CANCELLED
+  signedAt       DateTime?
+  clauses        Json      @default("{}")
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  @@index([companyId])
+  @@map("sa_contracts")
+}
+
+/// Fatura gerada para um tenant.
+model SaInvoice {
+  id          String    @id @default(cuid())
+  companyId   String?
+  company     Company?  @relation(fields: [companyId], references: [id], onDelete: SetNull)
+  description String
+  amount      Float
+  dueDate     DateTime
+  paidAt      DateTime?
+  status      String    @default("PENDING") // PENDING | PAID | OVERDUE | CANCELLED
+  notes       String?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  @@index([companyId])
+  @@index([status])
+  @@map("sa_invoices")
+}
+
+/// Ticket de suporte aberto por um tenant.
+model SupportTicket {
+  id          String        @id @default(cuid())
+  companyId   String?
+  company     Company?      @relation(fields: [companyId], references: [id], onDelete: SetNull)
+  authorEmail String
+  authorName  String
+  subject     String
+  status      String        @default("OPEN") // OPEN | IN_PROGRESS | RESOLVED | CLOSED
+  priority    String        @default("MEDIUM") // LOW | MEDIUM | HIGH | CRITICAL
+  createdAt   DateTime      @default(now())
+  updatedAt   DateTime      @updatedAt
+
+  replies     TicketReply[]
+
+  @@index([companyId])
+  @@index([status])
+  @@map("support_tickets")
+}
+
+/// Resposta a um ticket de suporte.
+model TicketReply {
+  id          String        @id @default(cuid())
+  ticketId    String
+  ticket      SupportTicket @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  authorEmail String
+  authorName  String
+  body        String
+  isInternal  Boolean       @default(false)
+  createdAt   DateTime      @default(now())
+
+  @@index([ticketId])
+  @@map("ticket_replies")
 }
 
 /// Registro de emails enviados — impede reenvio duplicado dentro da janela de dedup.

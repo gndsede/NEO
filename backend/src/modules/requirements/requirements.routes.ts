@@ -20,6 +20,21 @@ router.patch(
   requireCapability("registros.manage"),
   asyncHandler(requirementsController.updateDefinition),
 );
+router.post(
+  "/definitions/import",
+  requireCapability("registros.manage"),
+  asyncHandler(requirementsController.importDefinitions),
+);
+router.get(
+  "/definitions/:id/access",
+  requireCapability("registros.view", "registros.manage"),
+  asyncHandler(requirementsController.getDefinitionAccess),
+);
+router.put(
+  "/definitions/:id/access",
+  requireCapability("registros.manage"),
+  asyncHandler(requirementsController.setDefinitionAccess),
+);
 
 router.get(
   "/worker-functions",
@@ -40,6 +55,11 @@ router.post(
   requireCapability("tipos.manage"),
   asyncHandler(requirementsController.copyWorkerFunctionRequirements),
 );
+router.post(
+  "/worker-functions/import",
+  requireCapability("tipos.manage"),
+  asyncHandler(requirementsController.importWorkerFunctions),
+);
 
 router.get(
   "/contractor-types",
@@ -59,6 +79,11 @@ router.post(
   "/contractor-types/copy-requirements",
   requireCapability("tipos.manage"),
   asyncHandler(requirementsController.copyContractorTypeRequirements),
+);
+router.post(
+  "/contractor-types/import",
+  requireCapability("tipos.manage"),
+  asyncHandler(requirementsController.importContractorTypes),
 );
 
 export const requirementsRoutes = router;

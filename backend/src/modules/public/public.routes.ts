@@ -1,6 +1,7 @@
 import { Router } from "express";
 import { prisma } from "../../lib/prisma.js";
 import { asyncHandler } from "../../middleware/async-handler.js";
+import { publicRateLimit } from "../../middleware/rate-limit.js";
 import {
   isValidNeoAccessToken,
   NEO_QR_SPEC,
@@ -8,6 +9,9 @@ import {
 } from "../../utils/access-hash.js";
 
 const router = Router();
+
+// Endpoints públicos são o alvo natural de enumeração — limite agressivo por IP.
+router.use(publicRateLimit);
 
 /** Especificação do formato de token/QR para integração de TI externa. */
 router.get(
@@ -48,14 +52,17 @@ router.get(
       where: { qrHash: token },
       select: {
         id: true,
-        fullName: true,
-        status: true,
-        registration: true,
         company: { select: { name: true, siteName: true } },
-        contractor: { select: { name: true } },
+        assignments: {
+          select: { status: true },
+          where: { status: "ACTIVE" },
+          take: 1,
+        },
       },
     });
 
+    // Expose only the minimal fields needed for QR-integration verification.
+    // fullName, registration, and contractor are omitted from this unauthenticated endpoint.
     res.json({
       valid: !!worker,
       token,
@@ -64,11 +71,8 @@ router.get(
       worker: worker
         ? {
             id: worker.id,
-            fullName: worker.fullName,
-            status: worker.status,
-            registration: worker.registration,
+            status: worker.assignments[0]?.status ?? "INACTIVE",
             company: worker.company.siteName ?? worker.company.name,
-            contractor: worker.contractor.name,
           }
         : null,
     });

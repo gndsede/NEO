@@ -1,9 +1,12 @@
 import { Router, type Request } from "express";
-import { RequirementCollectionStatus } from "@prisma/client";
+import {
+  DocumentStatus,
+  RequirementCollectionStatus,
+} from "@prisma/client";
 import type { EffectiveRequirementStatus } from "@prisma/client";
 import { prisma } from "../../lib/prisma.js";
 import { asyncHandler } from "../../middleware/async-handler.js";
-import { authenticate } from "../../middleware/auth.js";
+import { authenticate, requireCapability } from "../../middleware/auth.js";
 import {
   contractorScopeWhere,
   scopeFromRequest,
@@ -54,6 +57,8 @@ router.get(
       contractorsCount,
       topWorkerReqGroups,
       topContractorReqGroups,
+      pendingWorkerDocuments,
+      pendingContractorDocuments,
     ] = await Promise.all([
       prisma.workerRequirementItem.groupBy({
         by: ["status"],
@@ -101,6 +106,23 @@ router.get(
         orderBy: { _count: { contractorId: "desc" } },
         take: 5,
       }),
+      // Documentos aguardando avaliação — fonte de verdade alinhada com /documentos/pendentes.
+      prisma.document.count({
+        where: {
+          companyId: companyIdValue,
+          status: DocumentStatus.PENDENTE,
+          ownerType: "WORKER",
+          worker: workerScope,
+        },
+      }),
+      prisma.document.count({
+        where: {
+          companyId: companyIdValue,
+          status: DocumentStatus.PENDENTE,
+          ownerType: "CONTRACTOR",
+          contractor: contractorScope,
+        },
+      }),
     ]);
 
     const workerStatus = workerStatusGroups.reduce((acc, g) => {
@@ -112,6 +134,10 @@ router.get(
       acc[g.status] = (acc[g.status] ?? 0) + g._count._all;
       return acc;
     }, emptyStatus());
+
+    // "Aguardando avaliação" reflete documentos PENDENTE (não só exigências vinculadas).
+    workerStatus.PENDING_APPROVAL = pendingWorkerDocuments;
+    contractorStatus.PENDING_APPROVAL = pendingContractorDocuments;
 
     const totals = emptyStatus();
     for (const key of Object.keys(totals)) {
@@ -182,8 +208,12 @@ function parseEffectiveStatus(raw: unknown): EffectiveRequirementStatus[] | unde
   return valid.length ? (valid as EffectiveRequirementStatus[]) : undefined;
 }
 
+// Exports contêm PII (CPF/RG) — restritos a quem tem acesso a relatórios.
+const canExport = requireCapability("dashboard.view");
+
 router.get(
   "/export/workers",
+  canExport,
   asyncHandler(async (req, res) => {
     const scope = scopeFromRequest(req);
     await reportWorkers(
@@ -200,6 +230,7 @@ router.get(
 
 router.get(
   "/export/compliance",
+  canExport,
   asyncHandler(async (req, res) => {
     const scope = scopeFromRequest(req);
     await reportCompliance(
@@ -216,6 +247,7 @@ router.get(
 
 router.get(
   "/export/access",
+  canExport,
   asyncHandler(async (req, res) => {
     const scope = scopeFromRequest(req);
     const from = req.query.from ? new Date(String(req.query.from)) : undefined;
@@ -235,6 +267,7 @@ router.get(
 
 router.get(
   "/export/contractor-pending",
+  canExport,
   asyncHandler(async (req, res) => {
     const scope = scopeFromRequest(req);
     await reportContractorPending(

@@ -104,14 +104,51 @@ export function scopeFromRequest(req: Request): AuthScope {
   return req.user as AuthScope;
 }
 
+/**
+ * Filtro Prisma para Worker no novo modelo com WorkerAssignment.
+ * Workers são filtrados via seu vínculo (assignment) com as obras do escopo.
+ */
 export function workerScopeWhere(scope: AuthScope): Prisma.WorkerWhereInput {
+  const assignmentFilter: Prisma.WorkerAssignmentWhereInput = {};
+
+  if (scope.activeObraId) {
+    assignmentFilter.obraId = scope.activeObraId;
+  } else if (scope.obraIds.length > 0) {
+    assignmentFilter.obraId = { in: scope.obraIds };
+  }
+
+  if (scope.profile === "COLLABORATOR" && scope.contractorId) {
+    assignmentFilter.contractorId = scope.contractorId;
+  }
+
   return {
     companyId: scope.companyId,
-    ...obraWhere(scope),
-    ...(scope.profile === "COLLABORATOR" && scope.contractorId
-      ? { contractorId: scope.contractorId }
-      : {}),
+    assignments: { some: assignmentFilter },
   };
+}
+
+/**
+ * Retorna o filtro de assignment para o escopo do usuário.
+ * Usado quando se quer filtrar diretamente sobre WorkerAssignment.
+ */
+export function assignmentScopeWhere(
+  scope: AuthScope,
+): Prisma.WorkerAssignmentWhereInput {
+  const where: Prisma.WorkerAssignmentWhereInput = {
+    companyId: scope.companyId,
+  };
+
+  if (scope.activeObraId) {
+    where.obraId = scope.activeObraId;
+  } else if (scope.obraIds.length > 0) {
+    where.obraId = { in: scope.obraIds };
+  }
+
+  if (scope.profile === "COLLABORATOR" && scope.contractorId) {
+    where.contractorId = scope.contractorId;
+  }
+
+  return where;
 }
 
 export function contractorScopeWhere(

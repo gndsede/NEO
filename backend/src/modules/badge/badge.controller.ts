@@ -11,10 +11,7 @@ export const badgeController = {
    */
   async generate(req: Request, res: Response) {
     if (!req.user) throw Unauthorized();
-    const payload = await badgeService.generate(
-      req.user.companyId,
-      String(req.params.id),
-    );
+    const payload = await badgeService.generate(req.user, String(req.params.id));
     res.json(payload);
   },
 
@@ -25,10 +22,7 @@ export const badgeController = {
    */
   async qrcodePng(req: Request, res: Response) {
     if (!req.user) throw Unauthorized();
-    const payload = await badgeService.generate(
-      req.user.companyId,
-      String(req.params.id),
-    );
+    const payload = await badgeService.generate(req.user, String(req.params.id));
     const base64 = payload.access.qrCodeDataUrl.replace(
       /^data:image\/png;base64,/,
       "",

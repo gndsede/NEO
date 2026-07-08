@@ -66,7 +66,16 @@ export async function runAutoExitOnce(now: Date = new Date()): Promise<number> {
       workerId: true,
       occurredAt: true,
       gate: true,
-      worker: { select: { shiftStart: true, shiftEnd: true } },
+      worker: {
+        select: {
+          assignments: {
+            select: { shiftStart: true, shiftEnd: true },
+            where: { status: "ACTIVE" },
+            orderBy: { createdAt: "asc" as const },
+            take: 1,
+          },
+        },
+      },
     },
     orderBy: { occurredAt: "desc" },
     take: 500,
@@ -77,7 +86,8 @@ export async function runAutoExitOnce(now: Date = new Date()): Promise<number> {
   for (const entry of candidates) {
     if (!entry.workerId || !entry.worker) continue;
 
-    const exitAt = autoExitInstant(entry.occurredAt, entry.worker);
+    const shift: ShiftLike = entry.worker.assignments[0] ?? { shiftStart: null, shiftEnd: null };
+    const exitAt = autoExitInstant(entry.occurredAt, shift);
     // Ainda não chegou a hora do auto-exit para esta entrada.
     if (exitAt.getTime() > now.getTime()) continue;
 
@@ -96,8 +106,8 @@ export async function runAutoExitOnce(now: Date = new Date()): Promise<number> {
     // - Se for ENTRY, alguém já abriu nova sessão (o estado virou par).
     if (laterLog) continue;
 
-    const reason = entry.worker.shiftEnd
-      ? `Saída automática no fim do turno (${entry.worker.shiftEnd}).`
+    const reason = shift.shiftEnd
+      ? `Saída automática no fim do turno (${shift.shiftEnd}).`
       : "Saída automática após 8h sem registro manual";
 
     await prisma.accessLog.create({

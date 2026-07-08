@@ -43,7 +43,7 @@ const shiftTimeLike = z
 /**
  * Metadados dos documentos enviados no cadastro. Enviar como JSON string
  * no campo `documentsMeta` (alinhado posicionalmente aos arquivos `documents`).
- * Ex.: documentsMeta = '[{"type":"ASO","expiresAt":"2026-12-31"}, ...]'
+ * Ex.: documentsMeta = '[{"type":"SAFETY","title":"ASO","expiresAt":"2026-12-31"}, ...]'
  */
 export const documentMetaSchema = z.object({
   type: z.nativeEnum(DocumentType),
@@ -52,6 +52,7 @@ export const documentMetaSchema = z.object({
   expiresAt: dateLike,
 });
 
+/** Cadastro inicial de colaborador — cria Worker + primeiro WorkerAssignment. */
 export const createWorkerSchema = z.object({
   contractorId: z.string().min(1, "contractorId é obrigatório"),
   functionId: z.string().optional(),
@@ -70,8 +71,11 @@ export const createWorkerSchema = z.object({
     .optional()
     .or(z.literal("").transform(() => undefined)),
   phone: optionalString,
+  // Campos do vínculo com a obra (vão para WorkerAssignment)
   role: z.string().trim().min(2, "Função é obrigatória"),
   registration: optionalString,
+  /// Data de início (período de coleta) nesta obra.
+  admissionDate: dateLike,
   shiftStart: shiftTimeLike,
   shiftEnd: shiftTimeLike,
   documentsMeta: z
@@ -99,14 +103,48 @@ export const createWorkerSchema = z.object({
 export type CreateWorkerInput = z.infer<typeof createWorkerSchema>;
 export type DocumentMeta = z.infer<typeof documentMetaSchema>;
 
-export const updateWorkerSchema = createWorkerSchema
-  .omit({ documentsMeta: true })
-  .partial()
-  .extend({
-    status: z.nativeEnum(WorkerStatus).optional(),
-  });
+/** Atualização de dados pessoais do colaborador (não altera nenhuma obra). */
+export const updateWorkerSchema = z.object({
+  fullName: z.string().trim().min(3).optional(),
+  rg: optionalString,
+  birthDate: dateLike,
+  email: z
+    .string()
+    .trim()
+    .email("E-mail inválido")
+    .optional()
+    .or(z.literal("").transform(() => undefined)),
+  phone: optionalString,
+});
 
 export type UpdateWorkerInput = z.infer<typeof updateWorkerSchema>;
+
+/** Criação de um novo vínculo (WorkerAssignment) para colaborador já existente. */
+export const createAssignmentSchema = z.object({
+  contractorId: z.string().min(1, "contractorId é obrigatório"),
+  functionId: z.string().optional(),
+  role: z.string().trim().min(2, "Função é obrigatória"),
+  registration: optionalString,
+  admissionDate: dateLike,
+  shiftStart: shiftTimeLike,
+  shiftEnd: shiftTimeLike,
+});
+
+export type CreateAssignmentInput = z.infer<typeof createAssignmentSchema>;
+
+/** Atualização de dados do vínculo com uma obra (WorkerAssignment). */
+export const updateAssignmentSchema = z.object({
+  contractorId: z.string().min(1).optional(),
+  functionId: z.string().optional(),
+  role: z.string().trim().min(2).optional(),
+  registration: optionalString,
+  admissionDate: dateLike,
+  shiftStart: shiftTimeLike,
+  shiftEnd: shiftTimeLike,
+  status: z.nativeEnum(WorkerStatus).optional(),
+});
+
+export type UpdateAssignmentInput = z.infer<typeof updateAssignmentSchema>;
 
 /** Linha de importação em lote (planilha). Resolve empreiteira/função por nome. */
 export const importWorkerRowSchema = z.object({
@@ -133,7 +171,7 @@ export const importWorkersSchema = z.object({
 export type ImportWorkerRow = z.infer<typeof importWorkerRowSchema>;
 
 export const listWorkersQuerySchema = z.object({
-  // Filtros granulares (operador "Contém" / "Igual a")
+  // Filtros granulares
   name: z.string().optional(),
   cpf: z.string().optional(),
   rg: z.string().optional(),
@@ -142,7 +180,7 @@ export const listWorkersQuerySchema = z.object({
   contractorId: z.string().optional(),
   functionId: z.string().optional(),
 
-  /** Turno: DAY (diurno) | NIGHT (noturno) | NONE (sem turno cadastrado). */
+  /** Turno: DAY | NIGHT | NONE. Filtrado em memória no assignment ativo. */
   shift: z.enum(["DAY", "NIGHT", "NONE"]).optional(),
   /** "true" devolve só quem tem foto; "false" só quem não tem. */
   hasPhoto: z
@@ -154,10 +192,6 @@ export const listWorkersQuerySchema = z.object({
   createdFrom: dateLike,
   createdTo: dateLike,
 
-  /**
-   * Filtra colaboradores que possuem ao menos uma exigência com o status efetivo informado.
-   * Aceita um ou múltiplos valores: ?effectiveStatus=EM_FALTA&effectiveStatus=AGUARDANDO
-   */
   effectiveStatus: z
     .union([
       z.nativeEnum(EffectiveRequirementStatus),
@@ -168,7 +202,7 @@ export const listWorkersQuerySchema = z.object({
       v === undefined ? undefined : Array.isArray(v) ? v : [v],
     ),
 
-  /** Busca global fallback (usada quando o front mantém um único campo). */
+  /** Busca global fallback. */
   search: z.string().optional(),
   page: z.coerce.number().int().positive().default(1),
   pageSize: z.coerce.number().int().positive().max(1000).default(20),
@@ -182,6 +216,8 @@ export const addManualWorkerRequirementSchema = z.object({
   frequency: z.nativeEnum(RequirementFrequency),
   monthlyDueDay: z.coerce.number().int().min(1).max(31).optional(),
   referenceDate: dateLike,
+  /** Vínculo (obra) ao qual a exigência manual pertence. */
+  assignmentId: z.string().optional(),
 });
 
 export type AddManualWorkerRequirementInput = z.infer<
@@ -200,6 +236,7 @@ export const listAllRequirementsQuerySchema = z.object({
     ),
   contractorId: z.string().optional(),
   workerId: z.string().optional(),
+  assignmentId: z.string().optional(),
   page: z.coerce.number().int().positive().default(1),
   pageSize: z.coerce.number().int().positive().max(200).default(50),
 });

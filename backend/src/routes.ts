@@ -7,11 +7,13 @@ import { accessRoutes } from "./modules/access/access.routes.js";
 import { requirementsRoutes } from "./modules/requirements/requirements.routes.js";
 import { reportRoutes } from "./modules/reports/report.routes.js";
 import { usersRoutes } from "./modules/users/users.routes.js";
+import { groupRoutes } from "./modules/groups/group.routes.js";
 import { crachasRoutes } from "./modules/crachas/crachas.routes.js";
 import { obrasRoutes } from "./modules/obras/obras.routes.js";
 import { publicRoutes } from "./modules/public/public.routes.js";
 import { syncRoutes } from "./modules/sync/sync.routes.js";
 import { rdoRoutes } from "./modules/rdo/rdo.routes.js";
+import { saRoutes } from "./modules/super-admin/sa.routes.js";
 
 export const apiRouter = Router();
 
@@ -28,7 +30,9 @@ apiRouter.use("/access", accessRoutes);
 apiRouter.use("/requirements", requirementsRoutes);
 apiRouter.use("/reports", reportRoutes);
 apiRouter.use("/users", usersRoutes);
+apiRouter.use("/groups", groupRoutes);
 apiRouter.use("/obras", obrasRoutes);
 apiRouter.use("/crachas", crachasRoutes);
 apiRouter.use("/sync", syncRoutes);
 apiRouter.use("/rdo", rdoRoutes);
+apiRouter.use("/super-admin", saRoutes);

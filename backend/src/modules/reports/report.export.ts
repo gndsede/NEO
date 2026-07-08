@@ -6,9 +6,10 @@ import path from "path";
 import type { Response } from "express";
 import { EffectiveRequirementStatus } from "@prisma/client";
 import { prisma } from "../../lib/prisma.js";
+import { decrypt } from "../../lib/crypto.js";
 import {
+  assignmentScopeWhere,
   contractorScopeWhere,
-  workerScopeWhere,
   type AuthScope,
 } from "../../lib/scope.js";
 
@@ -246,30 +247,31 @@ export async function reportWorkers(
   format: "xlsx" | "pdf",
   res: Response,
 ): Promise<void> {
-  const items = await prisma.worker.findMany({
+  const items = await prisma.workerAssignment.findMany({
     where: {
-      ...workerScopeWhere(scope),
+      ...assignmentScopeWhere(scope),
       ...(filters.contractorId ? { contractorId: filters.contractorId } : {}),
       ...(filters.status ? { status: filters.status as never } : {}),
     },
     include: {
+      worker: { select: { fullName: true, cpf: true, rg: true, createdAt: true } },
       contractor: { select: { name: true } },
       obra: { select: { name: true } },
       function: { select: { name: true } },
     },
-    orderBy: [{ contractor: { name: "asc" } }, { fullName: "asc" }],
+    orderBy: [{ contractor: { name: "asc" } }, { worker: { fullName: "asc" } }],
   });
 
-  const rows = items.map((w) => [
-    w.fullName,
-    w.cpf,
-    w.rg ?? "—",
-    w.function?.name ?? w.role,
-    w.contractor.name,
-    w.obra.name,
-    workerStatusLabel[w.status] ?? w.status,
-    w.registration ?? "—",
-    fmtDate(w.createdAt),
+  const rows = items.map((a) => [
+    a.worker.fullName,
+    decrypt(a.worker.cpf),
+    a.worker.rg ? decrypt(a.worker.rg) : "—",
+    a.function?.name ?? a.role,
+    a.contractor.name,
+    a.obra.name,
+    workerStatusLabel[a.status] ?? a.status,
+    a.registration ?? "—",
+    fmtDate(a.worker.createdAt),
   ]);
 
   if (format === "xlsx") {
@@ -308,33 +310,29 @@ export async function reportCompliance(
   format: "xlsx" | "pdf",
   res: Response,
 ): Promise<void> {
+  const assignmentScope = assignmentScopeWhere(scope);
   const items = await prisma.workerRequirementItem.findMany({
     where: {
       companyId: scope.companyId,
+      assignment: {
+        ...assignmentScope,
+        ...(filters.contractorId ? { contractorId: filters.contractorId } : {}),
+      },
       ...(filters.effectiveStatus?.length
         ? { effectiveStatus: { in: filters.effectiveStatus } }
         : {}),
-      worker: {
-        ...workerScopeWhere(scope),
-        ...(filters.contractorId ? { contractorId: filters.contractorId } : {}),
-      },
     },
     include: {
-      worker: {
-        select: {
-          fullName: true,
-          cpf: true,
-          contractor: { select: { name: true } },
-        },
-      },
+      worker: { select: { fullName: true, cpf: true } },
+      assignment: { select: { contractor: { select: { name: true } } } },
     },
     orderBy: [{ effectiveStatus: "asc" }, { worker: { fullName: "asc" } }],
   });
 
   const rows = items.map((item) => [
     item.worker.fullName,
-    item.worker.cpf,
-    item.worker.contractor.name,
+    decrypt(item.worker.cpf),
+    item.assignment?.contractor?.name ?? "—",
     item.name,
     item.documentType,
     effectiveStatusLabel[item.effectiveStatus] ?? item.effectiveStatus,
@@ -375,6 +373,16 @@ export async function reportAccess(
   format: "xlsx" | "pdf",
   res: Response,
 ): Promise<void> {
+  // When obraId filter is requested, pre-fetch workerIds that have an assignment at that obra.
+  let obraWorkerIds: string[] | undefined;
+  if (filters.obraId) {
+    const assignments = await prisma.workerAssignment.findMany({
+      where: { companyId: scope.companyId, obraId: filters.obraId },
+      select: { workerId: true },
+    });
+    obraWorkerIds = assignments.map((a) => a.workerId);
+  }
+
   const items = await prisma.accessLog.findMany({
     where: {
       companyId: scope.companyId,
@@ -386,16 +394,10 @@ export async function reportAccess(
             },
           }
         : {}),
-      ...(filters.obraId ? { worker: { obraId: filters.obraId } } : {}),
+      ...(obraWorkerIds ? { workerId: { in: obraWorkerIds } } : {}),
     },
     include: {
-      worker: {
-        select: {
-          fullName: true,
-          cpf: true,
-          contractor: { select: { name: true } },
-        },
-      },
+      worker: { select: { fullName: true, cpf: true } },
       operator: { select: { name: true } },
     },
     orderBy: { occurredAt: "desc" },
@@ -405,8 +407,8 @@ export async function reportAccess(
   const rows = items.map((log) => [
     fmtDateTime(log.occurredAt),
     log.worker?.fullName ?? "—",
-    log.worker?.cpf ?? "—",
-    log.worker?.contractor?.name ?? "—",
+    log.worker?.cpf ? decrypt(log.worker.cpf) : "—",
+    "—",
     directionLabel[log.direction] ?? log.direction,
     resultLabel[log.result] ?? log.result,
     log.gate ?? "—",
@@ -460,8 +462,8 @@ export async function reportContractorPending(
     },
     include: {
       obra: { select: { name: true } },
-      _count: { select: { workers: true } },
-      workers: {
+      _count: { select: { workerAssignments: true } },
+      workerAssignments: {
         select: {
           requirementItems: {
             where: { effectiveStatus: { in: PENDING_STATUSES } },
@@ -474,13 +476,13 @@ export async function reportContractorPending(
   });
 
   const rows = contractors.map((c) => {
-    const all = c.workers.flatMap((w) => w.requirementItems);
+    const all = c.workerAssignments.flatMap((a) => a.requirementItems);
     const unique = [...new Set(all.map((r) => r.name))];
     return [
       c.name,
       c.cnpj ?? "—",
       c.obra.name,
-      String(c._count.workers),
+      String(c._count.workerAssignments),
       String(all.length),
       unique.join(", ") || "—",
     ];

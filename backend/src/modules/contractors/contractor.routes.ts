@@ -86,6 +86,19 @@ function companyId(req: Request): string {
   return req.user.companyId;
 }
 
+const importContractorRowSchema = z.object({
+  name: z.string().trim().min(2, "Nome é obrigatório"),
+  legalName: z.string().trim().optional(),
+  cnpj: z.string().trim().optional(),
+  email: z.string().trim().optional(),
+  phone: z.string().trim().optional(),
+  typeName: z.string().trim().optional(),
+});
+
+const importContractorsSchema = z.object({
+  rows: z.array(z.record(z.string(), z.unknown())).min(1, "Envie ao menos uma linha"),
+});
+
 const listQuerySchema = z.object({
   name: z.string().optional(),
   legalName: z.string().optional(),
@@ -204,7 +217,7 @@ router.get(
       include: {
         obra: { select: { id: true, name: true } },
         type: { select: { id: true, name: true } },
-        _count: { select: { workers: true, documents: true } },
+        _count: { select: { workerAssignments: true, documents: true } },
       },
     });
     res.json({ items });
@@ -218,7 +231,7 @@ router.get(
     const item = await prisma.contractor.findFirst({
       where: { id: String(req.params.id), ...contractorScopeWhere(scope) },
       include: {
-        workers: true,
+        workerAssignments: { include: { worker: true } },
         documents: true,
         type: true,
         obra: { select: { id: true, name: true } },
@@ -226,7 +239,12 @@ router.get(
       },
     });
     if (!item) throw NotFound("Empreiteira não encontrada");
-    res.json(item);
+    // Mantém `workers` no retorno (lista de colaboradores vinculados) para o frontend.
+    const { workerAssignments, ...rest } = item;
+    res.json({
+      ...rest,
+      workers: workerAssignments.map((a) => a.worker),
+    });
   }),
 );
 
@@ -317,17 +335,9 @@ router.patch(
         include: {
           obra: { select: { id: true, name: true } },
           type: { select: { id: true, name: true } },
-          _count: { select: { workers: true } },
+          _count: { select: { workerAssignments: true } },
         },
       });
-
-      // Se a obra mudou, atualiza o obraId de todos os workers desta empreiteira.
-      if (data.obraId && data.obraId !== existing.obraId) {
-        await tx.worker.updateMany({
-          where: { contractorId: id, companyId: companyIdValue },
-          data: { obraId: data.obraId },
-        });
-      }
 
       if (contractor.typeId) {
         await requirementsService.syncContractorRequirementsForType(tx, {
@@ -341,6 +351,116 @@ router.patch(
       return contractor;
     });
     res.json(updated);
+  }),
+);
+
+/**
+ * Importação em lote a partir de linhas de planilha. Resolve/cria o tipo de
+ * fornecedor por nome (case-insensitive) e ignora linhas inválidas/duplicadas
+ * retornando um relatório por linha.
+ */
+router.post(
+  "/import",
+  requireCapability("fornecedores.manage"),
+  asyncHandler(async (req, res) => {
+    const scope = scopeFromRequest(req);
+    const companyIdValue = scope.companyId;
+    const obraId = requiredObraId(scope);
+    await ensureObraAccess(scope, obraId);
+    const { rows } = importContractorsSchema.parse(req.body);
+
+    const results: Array<{
+      line: number;
+      status: "created" | "error";
+      message?: string;
+      name?: string;
+    }> = [];
+    let created = 0;
+
+    for (let i = 0; i < rows.length; i++) {
+      const line = i + 1;
+      const parsed = importContractorRowSchema.safeParse(rows[i]);
+      if (!parsed.success) {
+        results.push({
+          line,
+          status: "error",
+          message: parsed.error.issues
+            .map((iss) => `${iss.path.join(".")}: ${iss.message}`)
+            .join("; "),
+        });
+        continue;
+      }
+      const data = parsed.data;
+      try {
+        const cnpjDigits = data.cnpj ? data.cnpj.replace(/\D/g, "") : undefined;
+        if (cnpjDigits) {
+          const duplicate = await prisma.contractor.findFirst({
+            where: { obraId, cnpj: cnpjDigits },
+            select: { id: true },
+          });
+          if (duplicate) {
+            results.push({
+              line,
+              status: "error",
+              message: "CNPJ já cadastrado nesta obra",
+              name: data.name,
+            });
+            continue;
+          }
+        }
+
+        const contractor = await prisma.$transaction(async (tx) => {
+          let typeId: string | undefined;
+          if (data.typeName) {
+            const type = await tx.contractorType.upsert({
+              where: {
+                companyId_name: { companyId: companyIdValue, name: data.typeName! },
+              },
+              update: {},
+              create: { companyId: companyIdValue, name: data.typeName! },
+              select: { id: true },
+            });
+            typeId = type.id;
+          }
+
+          const created_ = await tx.contractor.create({
+            data: {
+              companyId: companyIdValue,
+              obraId,
+              typeId,
+              name: data.name,
+              legalName: data.legalName || undefined,
+              cnpj: cnpjDigits,
+              email: data.email || undefined,
+              phone: data.phone || undefined,
+            },
+          });
+
+          if (created_.typeId) {
+            await requirementsService.syncContractorRequirementsForType(tx, {
+              companyId: companyIdValue,
+              contractorId: created_.id,
+              contractorTypeId: created_.typeId,
+              createdById: req.user?.id,
+            });
+          }
+
+          return created_;
+        });
+
+        created += 1;
+        results.push({ line, status: "created", name: contractor.name });
+      } catch (err) {
+        results.push({
+          line,
+          status: "error",
+          message: err instanceof Error ? err.message : "Erro desconhecido",
+          name: data.name,
+        });
+      }
+    }
+
+    res.status(201).json({ created, total: rows.length, results });
   }),
 );
 

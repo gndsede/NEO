@@ -8,8 +8,16 @@ const router = Router();
 
 router.use(authenticate);
 
-router.get("/", asyncHandler(documentController.list));
-router.get("/:id", asyncHandler(documentController.getById));
+router.get(
+  "/",
+  requireCapability("documentos.view", "documentos.attach", "documentos.approve"),
+  asyncHandler(documentController.list),
+);
+router.get(
+  "/:id",
+  requireCapability("documentos.view", "documentos.attach", "documentos.approve"),
+  asyncHandler(documentController.getById),
+);
 
 router.post(
   "/",

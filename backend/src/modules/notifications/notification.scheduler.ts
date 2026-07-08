@@ -17,25 +17,27 @@ async function tick(): Promise<void> {
   // -------------------------------------------------------------------------
   // Worker requirement items: expirando nos próximos 7 dias
   // -------------------------------------------------------------------------
+  // A empreiteira vem pelo vínculo (assignment) do colaborador — o modelo Worker
+  // não tem mais contractor direto desde a migração para WorkerAssignment.
+  const itemSelect = {
+    id: true,
+    name: true,
+    expiresAt: true,
+    companyId: true,
+    worker: { select: { fullName: true } },
+    assignment: {
+      select: {
+        contractor: { select: { id: true, name: true, email: true } },
+      },
+    },
+  } as const;
+
   const expiringSoon = await prisma.workerRequirementItem.findMany({
     where: {
       status: RequirementCollectionStatus.APPROVED,
       expiresAt: { gte: now, lte: in7Days },
     },
-    select: {
-      id: true,
-      name: true,
-      expiresAt: true,
-      companyId: true,
-      worker: {
-        select: {
-          fullName: true,
-          contractor: {
-            select: { id: true, name: true, email: true },
-          },
-        },
-      },
-    },
+    select: itemSelect,
   });
 
   // Worker requirement items: já vencidos (últimos 30 dias para não notificar indefinidamente)
@@ -44,20 +46,7 @@ async function tick(): Promise<void> {
       status: RequirementCollectionStatus.APPROVED,
       expiresAt: { gte: thirtyDaysAgo, lt: now },
     },
-    select: {
-      id: true,
-      name: true,
-      expiresAt: true,
-      companyId: true,
-      worker: {
-        select: {
-          fullName: true,
-          contractor: {
-            select: { id: true, name: true, email: true },
-          },
-        },
-      },
-    },
+    select: itemSelect,
   });
 
   // -------------------------------------------------------------------------
@@ -71,10 +60,10 @@ type ItemRow = {
   name: string;
   expiresAt: Date | null;
   companyId: string;
-  worker: {
-    fullName: string;
+  worker: { fullName: string };
+  assignment: {
     contractor: { id: string; name: string; email: string | null };
-  };
+  } | null;
 };
 
 async function processGroup(items: ItemRow[], expired: boolean): Promise<void> {
@@ -85,8 +74,8 @@ async function processGroup(items: ItemRow[], expired: boolean): Promise<void> {
   >();
 
   for (const item of items) {
-    const c = item.worker.contractor;
-    if (!c.email || !item.expiresAt) continue;
+    const c = item.assignment?.contractor;
+    if (!c || !c.email || !item.expiresAt) continue;
 
     const key = c.id;
     if (!byContractor.has(key)) {

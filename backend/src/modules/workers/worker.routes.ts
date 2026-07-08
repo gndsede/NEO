@@ -30,26 +30,57 @@ router.post(
   asyncHandler(workerController.importBatch),
 );
 
-router.get("/", asyncHandler(workerController.list));
+// Leituras expõem PII — exigem permissão de colaboradores ou de documentação.
+const canViewWorkers = requireCapability(
+  "colaboradores.view",
+  "colaboradores.manage",
+  "documentos.view",
+  "documentos.attach",
+  "documentos.approve",
+);
+
+router.get("/", canViewWorkers, asyncHandler(workerController.list));
 // Rotas literais precisam vir antes de "/:id" para não serem capturadas como id.
 router.get(
   "/requirements",
+  canViewWorkers,
   asyncHandler(workerController.listAllRequirements),
 );
 router.get(
   "/requirements-summary",
+  canViewWorkers,
   asyncHandler(workerController.requirementsSummary),
 );
 router.get(
   "/:id/access-token",
+  requireCapability(
+    "cracha.view",
+    "cracha.generate",
+    "colaboradores.view",
+    "colaboradores.manage",
+    "catraca.view",
+    "catraca.manage",
+  ),
   asyncHandler(workerController.getAccessToken),
 );
-router.get("/:id", asyncHandler(workerController.getById));
+router.get("/:id", canViewWorkers, asyncHandler(workerController.getById));
 
 router.patch(
   "/:id",
   requireCapability("colaboradores.manage"),
   asyncHandler(workerController.update),
+);
+
+router.post(
+  "/:id/assignments",
+  requireCapability("colaboradores.manage"),
+  asyncHandler(workerController.addAssignment),
+);
+
+router.patch(
+  "/:id/assignments/:assignmentId",
+  requireCapability("colaboradores.manage"),
+  asyncHandler(workerController.updateAssignment),
 );
 
 router.patch(
@@ -61,6 +92,7 @@ router.patch(
 
 router.get(
   "/:id/requirements",
+  canViewWorkers,
   asyncHandler(workerController.listRequirements),
 );
 
@@ -74,6 +106,17 @@ router.patch(
   "/:id/requirements/:itemId/applicability",
   requireCapability("documentos.mark_na"),
   asyncHandler(workerController.setRequirementApplicability),
+);
+
+/**
+ * POST /workers/:id/anonymize
+ * Anonimização irreversível de dados pessoais (LGPD Direito ao Apagamento).
+ * Requer body: { confirm: true }
+ */
+router.post(
+  "/:id/anonymize",
+  requireCapability("colaboradores.manage"),
+  asyncHandler(workerController.anonymize),
 );
 
 export const workerRoutes = router;

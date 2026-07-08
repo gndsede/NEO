@@ -6,12 +6,26 @@ import {
 } from "@prisma/client";
 import { prisma } from "../../lib/prisma.js";
 import { BadRequest, NotFound } from "../../lib/errors.js";
-import type {
-  ContractorTypeUpsertInput,
-  ListDefinitionQuery,
-  RequirementDefinitionUpsertInput,
-  WorkerFunctionUpsertInput,
+import {
+  importDefinitionRowSchema,
+  importNameDescRowSchema,
+  type ContractorTypeUpsertInput,
+  type ListDefinitionQuery,
+  type RequirementDefinitionUpsertInput,
+  type WorkerFunctionUpsertInput,
 } from "./requirements.schema.js";
+
+type ImportRowResult = {
+  line: number;
+  status: "created" | "error";
+  message?: string;
+  name?: string;
+};
+type ImportBatchResult = {
+  created: number;
+  total: number;
+  results: ImportRowResult[];
+};
 
 export class RequirementsService {
   private async validateRequirementIds(
@@ -151,13 +165,97 @@ export class RequirementsService {
         companyId,
         target: data.target,
         name: data.name,
+        description: data.description,
         documentType: data.documentType,
         frequency: data.frequency,
         monthlyDueDay: data.monthlyDueDay,
         referenceDate: data.referenceDate,
+        attachmentFormats: data.attachmentFormats,
+        attachmentRequired: data.attachmentRequired ?? true,
+        competenceMode: data.competenceMode ?? "NONE",
+        observations: data.observations,
+        grantsTurnstileAccess: data.grantsTurnstileAccess ?? false,
         active: data.active ?? true,
       },
     });
+  }
+
+  /** Retorna grupos e usuários com acesso concedido a um registro específico. */
+  async getDefinitionAccess(companyId: string, definitionId: string) {
+    const definition = await prisma.documentRequirementDefinition.findFirst({
+      where: { id: definitionId, companyId },
+      select: { id: true },
+    });
+    if (!definition) throw NotFound("Registro documental não encontrado");
+
+    const [groupAccess, userAccess] = await Promise.all([
+      prisma.requirementDefinitionGroupAccess.findMany({
+        where: { requirementId: definitionId },
+        select: { groupId: true },
+      }),
+      prisma.requirementDefinitionUserAccess.findMany({
+        where: { requirementId: definitionId },
+        select: { userId: true },
+      }),
+    ]);
+
+    return {
+      groupIds: groupAccess.map((g) => g.groupId),
+      userIds: userAccess.map((u) => u.userId),
+    };
+  }
+
+  /** Substitui a lista de grupos/usuários com acesso a um registro específico. */
+  async setDefinitionAccess(
+    companyId: string,
+    definitionId: string,
+    data: { groupIds: string[]; userIds: string[] },
+  ) {
+    const definition = await prisma.documentRequirementDefinition.findFirst({
+      where: { id: definitionId, companyId },
+      select: { id: true },
+    });
+    if (!definition) throw NotFound("Registro documental não encontrado");
+
+    if (data.groupIds.length) {
+      const validGroups = await prisma.userGroup.findMany({
+        where: { id: { in: data.groupIds }, companyId },
+        select: { id: true },
+      });
+      if (validGroups.length !== data.groupIds.length) {
+        throw NotFound("Um ou mais grupos informados não existem.");
+      }
+    }
+    if (data.userIds.length) {
+      const validUsers = await prisma.user.findMany({
+        where: { id: { in: data.userIds }, companyId },
+        select: { id: true },
+      });
+      if (validUsers.length !== data.userIds.length) {
+        throw NotFound("Um ou mais usuários informados não existem.");
+      }
+    }
+
+    await prisma.$transaction(async (tx) => {
+      await tx.requirementDefinitionGroupAccess.deleteMany({
+        where: { requirementId: definitionId },
+      });
+      if (data.groupIds.length) {
+        await tx.requirementDefinitionGroupAccess.createMany({
+          data: data.groupIds.map((groupId) => ({ requirementId: definitionId, groupId })),
+        });
+      }
+      await tx.requirementDefinitionUserAccess.deleteMany({
+        where: { requirementId: definitionId },
+      });
+      if (data.userIds.length) {
+        await tx.requirementDefinitionUserAccess.createMany({
+          data: data.userIds.map((userId) => ({ requirementId: definitionId, userId })),
+        });
+      }
+    });
+
+    return this.getDefinitionAccess(companyId, definitionId);
   }
 
   async updateDefinition(
@@ -385,6 +483,187 @@ export class RequirementsService {
         include: { requirements: { include: { requirement: true } } },
       });
     });
+  }
+
+  /**
+   * Importação em lote de funções de colaborador a partir de linhas de
+   * planilha (nome + descrição). Ignora linhas inválidas/duplicadas
+   * retornando um relatório por linha.
+   */
+  async importWorkerFunctions(
+    companyId: string,
+    rows: Array<Record<string, unknown>>,
+  ): Promise<ImportBatchResult> {
+    const results: ImportRowResult[] = [];
+    let created = 0;
+    for (let i = 0; i < rows.length; i++) {
+      const line = i + 1;
+      const parsed = importNameDescRowSchema.safeParse(rows[i]);
+      if (!parsed.success) {
+        results.push({
+          line,
+          status: "error",
+          message: parsed.error.issues
+            .map((iss) => `${iss.path.join(".")}: ${iss.message}`)
+            .join("; "),
+        });
+        continue;
+      }
+      const data = parsed.data;
+      try {
+        const existing = await prisma.workerFunction.findFirst({
+          where: { companyId, name: { equals: data.name, mode: "insensitive" } },
+          select: { id: true },
+        });
+        if (existing) {
+          results.push({
+            line,
+            status: "error",
+            message: "Função já cadastrada com este nome",
+            name: data.name,
+          });
+          continue;
+        }
+        await prisma.workerFunction.create({
+          data: { companyId, name: data.name, description: data.description },
+        });
+        created += 1;
+        results.push({ line, status: "created", name: data.name });
+      } catch (err) {
+        results.push({
+          line,
+          status: "error",
+          message: err instanceof Error ? err.message : "Erro desconhecido",
+          name: data.name,
+        });
+      }
+    }
+    return { created, total: rows.length, results };
+  }
+
+  /**
+   * Importação em lote de tipos de fornecedor a partir de linhas de
+   * planilha (nome + descrição). Ignora linhas inválidas/duplicadas
+   * retornando um relatório por linha.
+   */
+  async importContractorTypes(
+    companyId: string,
+    rows: Array<Record<string, unknown>>,
+  ): Promise<ImportBatchResult> {
+    const results: ImportRowResult[] = [];
+    let created = 0;
+    for (let i = 0; i < rows.length; i++) {
+      const line = i + 1;
+      const parsed = importNameDescRowSchema.safeParse(rows[i]);
+      if (!parsed.success) {
+        results.push({
+          line,
+          status: "error",
+          message: parsed.error.issues
+            .map((iss) => `${iss.path.join(".")}: ${iss.message}`)
+            .join("; "),
+        });
+        continue;
+      }
+      const data = parsed.data;
+      try {
+        const existing = await prisma.contractorType.findFirst({
+          where: { companyId, name: { equals: data.name, mode: "insensitive" } },
+          select: { id: true },
+        });
+        if (existing) {
+          results.push({
+            line,
+            status: "error",
+            message: "Tipo já cadastrado com este nome",
+            name: data.name,
+          });
+          continue;
+        }
+        await prisma.contractorType.create({
+          data: { companyId, name: data.name, description: data.description },
+        });
+        created += 1;
+        results.push({ line, status: "created", name: data.name });
+      } catch (err) {
+        results.push({
+          line,
+          status: "error",
+          message: err instanceof Error ? err.message : "Erro desconhecido",
+          name: data.name,
+        });
+      }
+    }
+    return { created, total: rows.length, results };
+  }
+
+  /**
+   * Importação em lote de registros documentais (RequirementDefinition) a
+   * partir de linhas de planilha. Ignora linhas inválidas/duplicadas
+   * retornando um relatório por linha.
+   */
+  async importDefinitions(
+    companyId: string,
+    rows: Array<Record<string, unknown>>,
+  ): Promise<ImportBatchResult> {
+    const results: ImportRowResult[] = [];
+    let created = 0;
+    for (let i = 0; i < rows.length; i++) {
+      const line = i + 1;
+      const parsed = importDefinitionRowSchema.safeParse(rows[i]);
+      if (!parsed.success) {
+        results.push({
+          line,
+          status: "error",
+          message: parsed.error.issues
+            .map((iss) => `${iss.path.join(".")}: ${iss.message}`)
+            .join("; "),
+        });
+        continue;
+      }
+      const data = parsed.data;
+      try {
+        const existing = await prisma.documentRequirementDefinition.findFirst({
+          where: {
+            companyId,
+            target: data.target as RequirementTarget,
+            name: { equals: data.name, mode: "insensitive" },
+          },
+          select: { id: true },
+        });
+        if (existing) {
+          results.push({
+            line,
+            status: "error",
+            message: "Registro já cadastrado com este nome para este alvo",
+            name: data.name,
+          });
+          continue;
+        }
+        await prisma.documentRequirementDefinition.create({
+          data: {
+            companyId,
+            target: data.target as RequirementTarget,
+            name: data.name,
+            documentType: data.documentType,
+            frequency: data.frequency,
+            monthlyDueDay: data.monthlyDueDay,
+            referenceDate: data.referenceDate,
+            active: true,
+          },
+        });
+        created += 1;
+        results.push({ line, status: "created", name: data.name });
+      } catch (err) {
+        results.push({
+          line,
+          status: "error",
+          message: err instanceof Error ? err.message : "Erro desconhecido",
+          name: data.name,
+        });
+      }
+    }
+    return { created, total: rows.length, results };
   }
 
   async copyWorkerFunctionRequirements(

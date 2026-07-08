@@ -1,5 +1,6 @@
 import {
   DocumentOwnerType,
+  DocumentStatus,
   RequirementCollectionStatus,
   RequirementFrequency,
   RequirementSource,
@@ -11,19 +12,25 @@ import { BadRequest, Conflict, NotFound } from "../../lib/errors.js";
 import {
   contractorScopeWhere,
   ensureContractorInScope,
+  assignmentScopeWhere,
   type AuthScope,
   workerScopeWhere,
 } from "../../lib/scope.js";
 import { generateNeoAccessToken } from "../../utils/access-hash.js";
-import { recomputeRequirementItem } from "../requirements/requirement-status.js";
+import { recomputeRequirementItem, recomputeWorkerRequirements } from "../requirements/requirement-status.js";
+import { decrypt, encrypt, hashCpf } from "../../lib/crypto.js";
+import { env } from "../../config/env.js";
+import { pickPrimaryAssignment } from "./worker.present.js";
 import {
   importWorkerRowSchema,
   type AddManualWorkerRequirementInput,
+  type CreateAssignmentInput,
   type CreateWorkerInput,
   type DocumentMeta,
   type ListAllRequirementsQuery,
   type ListWorkersQuery,
   type SetWorkerRequirementApplicabilityInput,
+  type UpdateAssignmentInput,
   type UpdateWorkerInput,
 } from "./worker.schema.js";
 
@@ -42,12 +49,55 @@ interface CreateWorkerParams {
   createdById?: string;
 }
 
+/** Include padrão para um Worker com dados completos de todos os vínculos. */
+const WORKER_FULL_INCLUDE = {
+  assignments: {
+    include: {
+      contractor: { select: { id: true, name: true, cnpj: true } },
+      obra: { select: { id: true, name: true } },
+      function: { select: { id: true, name: true } },
+      requirementItems: {
+        select: {
+          id: true,
+          name: true,
+          documentType: true,
+          effectiveStatus: true,
+          expiresAt: true,
+          status: true,
+          requirement: {
+            select: { id: true, name: true, frequency: true },
+          },
+        },
+      },
+    },
+    orderBy: { createdAt: "asc" as const },
+  },
+  documents: true,
+} satisfies Prisma.WorkerInclude;
+
+/** Include para listagem (mais leve). */
+const WORKER_LIST_INCLUDE = {
+  assignments: {
+    include: {
+      contractor: { select: { id: true, name: true } },
+      obra: { select: { id: true, name: true } },
+      requirementItems: { select: { effectiveStatus: true } },
+    },
+    orderBy: { createdAt: "asc" as const },
+  },
+} satisfies Prisma.WorkerInclude;
+
 /**
- * Classifica o turno do colaborador para o filtro da listagem.
- * - NONE: turno não cadastrado em pelo menos uma ponta.
- * - DAY: shiftStart <= shiftEnd (turno cabe num único dia).
- * - NIGHT: shiftStart > shiftEnd (entra num dia, sai no seguinte).
+ * Classifica o turno do vínculo para o filtro da listagem.
  */
+/**
+ * Decripta os campos PII de um Worker retornado pelo Prisma.
+ * Aplica decrypt() em cpf e rg (sem efeito se ENCRYPTION_KEY não estiver configurada).
+ */
+function decryptWorker<T extends { cpf: string; rg: string | null }>(w: T): T {
+  return { ...w, cpf: decrypt(w.cpf), rg: w.rg ? decrypt(w.rg) : null };
+}
+
 function matchesShift(
   shiftStart: string | null,
   shiftEnd: string | null,
@@ -63,17 +113,16 @@ function tokenize(raw: string): string[] {
 }
 
 /**
- * Pré-filtra IDs de workers que casam com a busca textual usando `unaccent`
- * do Postgres — busca parcial, em qualquer ordem, insensível a acento e
- * maiúsculas. Cada token vira um `AND ... ILIKE ...` no campo escolhido.
- *
- * Ex.: name="jose silva" pega "José da Silva Pereira".
+ * Pré-filtra IDs de workers por texto usando unaccent do Postgres.
+ * Busca nos campos pessoais do worker (fullName, rg, cpf, email, qrHash).
  */
 async function workerIdsMatchingText(params: {
-  scopeWhere: { companyId: string; obraId?: unknown };
-  filters: Array<{ field: "fullName" | "rg" | "registration" | "email"; raw: string }>;
+  companyId: string;
+  obraIds?: string[];
+  activeObraId?: string | null;
+  filters: Array<{ field: "fullName" | "rg" | "email"; raw: string }>;
 }): Promise<string[]> {
-  const { scopeWhere, filters } = params;
+  const { companyId, obraIds, activeObraId, filters } = params;
   const conditions: string[] = [];
   const values: string[] = [];
   let i = 1;
@@ -81,7 +130,7 @@ async function workerIdsMatchingText(params: {
   for (const { field, raw } of filters) {
     for (const t of tokenize(raw)) {
       conditions.push(
-        `unaccent(lower("${field}")) LIKE unaccent(lower($${i}))`,
+        `unaccent(lower(w."${field}")) LIKE unaccent(lower($${i}))`,
       );
       values.push(`%${t}%`);
       i += 1;
@@ -91,31 +140,25 @@ async function workerIdsMatchingText(params: {
   if (conditions.length === 0) return [];
 
   const companyParam = `$${i}`;
-  values.push(scopeWhere.companyId);
+  values.push(companyId);
   i += 1;
 
-  let obraClause = "";
-  // Filtro de obra do scope (uma única obra ou lista).
-  if (scopeWhere.obraId && typeof scopeWhere.obraId === "string") {
-    obraClause = ` AND "obraId" = $${i}`;
-    values.push(scopeWhere.obraId);
+  // Filtra por obra via join com worker_assignments
+  let obraJoin = "";
+  if (activeObraId) {
+    obraJoin = `INNER JOIN "worker_assignments" wa ON wa."workerId" = w.id AND wa."obraId" = $${i}`;
+    values.push(activeObraId);
     i += 1;
-  } else if (
-    scopeWhere.obraId &&
-    typeof scopeWhere.obraId === "object" &&
-    "in" in scopeWhere.obraId &&
-    Array.isArray((scopeWhere.obraId as { in: unknown[] }).in)
-  ) {
-    const ids = (scopeWhere.obraId as { in: string[] }).in;
-    if (ids.length === 0) return [];
-    const placeholders = ids.map((_, k) => `$${i + k}`).join(",");
-    obraClause = ` AND "obraId" IN (${placeholders})`;
-    values.push(...ids);
-    i += ids.length;
+  } else if (obraIds && obraIds.length > 0) {
+    const placeholders = obraIds.map((_, k) => `$${i + k}`).join(",");
+    obraJoin = `INNER JOIN "worker_assignments" wa ON wa."workerId" = w.id AND wa."obraId" IN (${placeholders})`;
+    values.push(...obraIds);
+    i += obraIds.length;
   }
 
-  const sql = `SELECT id FROM "workers"
-    WHERE "companyId" = ${companyParam}${obraClause}
+  const sql = `SELECT DISTINCT w.id FROM "workers" w
+    ${obraJoin}
+    WHERE w."companyId" = ${companyParam}
       AND ${conditions.join(" AND ")}`;
 
   const rows = await prisma.$queryRawUnsafe<{ id: string }[]>(sql, ...values);
@@ -123,14 +166,17 @@ async function workerIdsMatchingText(params: {
 }
 
 /**
- * Busca global (campo único): cada token precisa aparecer em pelo menos um
- * de {fullName, registration, qrHash, cpf}. Insensível a acento e caixa.
+ * Busca global: cada token deve aparecer em pelo menos um de
+ * {fullName, qrHash, cpf}. Insensível a acento e caixa.
  */
 async function workerIdsMatchingGlobal(params: {
-  scopeWhere: { companyId: string; obraId?: unknown };
+  companyId: string;
+  obraIds?: string[];
+  activeObraId?: string | null;
   raw: string;
 }): Promise<string[]> {
-  const tokens = tokenize(params.raw);
+  const { companyId, obraIds, activeObraId, raw } = params;
+  const tokens = tokenize(raw);
   if (tokens.length === 0) return [];
 
   const values: string[] = [];
@@ -139,63 +185,59 @@ async function workerIdsMatchingGlobal(params: {
 
   for (const t of tokens) {
     const tokenOr: string[] = [];
-    tokenOr.push(
-      `unaccent(lower("fullName")) LIKE unaccent(lower($${i}))`,
-    );
+    tokenOr.push(`unaccent(lower(w."fullName")) LIKE unaccent(lower($${i}))`);
     values.push(`%${t}%`);
     i += 1;
 
-    tokenOr.push(
-      `unaccent(lower(coalesce("registration", ''))) LIKE unaccent(lower($${i}))`,
-    );
-    values.push(`%${t}%`);
-    i += 1;
-
-    tokenOr.push(`lower("qrHash") LIKE lower($${i})`);
+    tokenOr.push(`lower(w."qrHash") LIKE lower($${i})`);
     values.push(`%${t}%`);
     i += 1;
 
     const digits = t.replace(/\D/g, "");
     if (digits.length > 0) {
-      tokenOr.push(`"cpf" LIKE $${i}`);
-      values.push(`%${digits}%`);
-      i += 1;
+      if (env.ENCRYPTION_KEY) {
+        // CPF criptografado: somente match exato por hash (11 dígitos)
+        if (digits.length === 11) {
+          tokenOr.push(`w."cpfHash" = $${i}`);
+          values.push(hashCpf(digits));
+          i += 1;
+        }
+      } else {
+        tokenOr.push(`w."cpf" LIKE $${i}`);
+        values.push(`%${digits}%`);
+        i += 1;
+      }
     }
     perTokenAnds.push(`(${tokenOr.join(" OR ")})`);
   }
 
   const companyParam = `$${i}`;
-  values.push(params.scopeWhere.companyId);
+  values.push(companyId);
   i += 1;
 
-  let obraClause = "";
-  if (params.scopeWhere.obraId && typeof params.scopeWhere.obraId === "string") {
-    obraClause = ` AND "obraId" = $${i}`;
-    values.push(params.scopeWhere.obraId);
+  let obraJoin = "";
+  if (activeObraId) {
+    obraJoin = `INNER JOIN "worker_assignments" wa ON wa."workerId" = w.id AND wa."obraId" = $${i}`;
+    values.push(activeObraId);
     i += 1;
-  } else if (
-    params.scopeWhere.obraId &&
-    typeof params.scopeWhere.obraId === "object" &&
-    "in" in params.scopeWhere.obraId &&
-    Array.isArray((params.scopeWhere.obraId as { in: unknown[] }).in)
-  ) {
-    const ids = (params.scopeWhere.obraId as { in: string[] }).in;
-    if (ids.length === 0) return [];
-    const placeholders = ids.map((_, k) => `$${i + k}`).join(",");
-    obraClause = ` AND "obraId" IN (${placeholders})`;
-    values.push(...ids);
-    i += ids.length;
+  } else if (obraIds && obraIds.length > 0) {
+    const placeholders = obraIds.map((_, k) => `$${i + k}`).join(",");
+    obraJoin = `INNER JOIN "worker_assignments" wa ON wa."workerId" = w.id AND wa."obraId" IN (${placeholders})`;
+    values.push(...obraIds);
+    i += obraIds.length;
   }
 
-  const sql = `SELECT id FROM "workers"
-    WHERE "companyId" = ${companyParam}${obraClause}
+  const sql = `SELECT DISTINCT w.id FROM "workers" w
+    ${obraJoin}
+    WHERE w."companyId" = ${companyParam}
       AND ${perTokenAnds.join(" AND ")}`;
+
   const rows = await prisma.$queryRawUnsafe<{ id: string }[]>(sql, ...values);
   return rows.map((r) => r.id);
 }
 
 export class WorkerService {
-  private async generateUniqueAccessToken(): Promise<string> {
+  private async generateUniqueQrHash(): Promise<string> {
     for (let attempt = 0; attempt < 30; attempt++) {
       const token = generateNeoAccessToken();
       const exists = await prisma.worker.findUnique({
@@ -215,16 +257,33 @@ export class WorkerService {
       where: { id: functionId, companyId, active: true },
       select: { id: true },
     });
-    if (!fn) {
-      throw NotFound("Função de colaborador não encontrada para esta empresa");
-    }
+    if (!fn) throw NotFound("Função de colaborador não encontrada para esta empresa");
   }
 
-  private async syncWorkerRequirementsFromFunction(
+  private matchRequirementItem(
+    items: Array<{ id: string; documentType: string; name: string }>,
+    meta: DocumentMeta,
+  ) {
+    const byType = items.find((item) => item.documentType === meta.type);
+    if (byType) return byType;
+    if (!meta.title) return undefined;
+    const title = meta.title.toLowerCase();
+    return (
+      items.find((item) => item.name.toLowerCase() === title) ??
+      items.find((item) => item.name.toLowerCase().includes(title))
+    );
+  }
+
+  /**
+   * Sincroniza exigências de uma função para um assignment específico.
+   * Não duplica exigências já existentes para o mesmo assignment.
+   */
+  private async syncFunctionRequirementsToAssignment(
     tx: Prisma.TransactionClient,
     params: {
       companyId: string;
       workerId: string;
+      assignmentId: string;
       functionId: string;
       createdById?: string;
     },
@@ -241,11 +300,11 @@ export class WorkerService {
     const existing = await tx.workerRequirementItem.findMany({
       where: {
         companyId: params.companyId,
-        workerId: params.workerId,
+        assignmentId: params.assignmentId,
         source: RequirementSource.FUNCTION_TEMPLATE,
         requirementId: { not: null },
       },
-      select: { id: true, requirementId: true },
+      select: { requirementId: true },
     });
     const existingRequirementIds = new Set(existing.map((item) => item.requirementId));
 
@@ -255,6 +314,7 @@ export class WorkerService {
         data: {
           companyId: params.companyId,
           workerId: params.workerId,
+          assignmentId: params.assignmentId,
           requirementId: rel.requirementId,
           source: RequirementSource.FUNCTION_TEMPLATE,
           status: RequirementCollectionStatus.NOT_SENT,
@@ -271,9 +331,9 @@ export class WorkerService {
 
   /**
    * Cadastro completo de um colaborador:
-   * 1. valida empreiteira pertencente ao tenant;
-   * 2. faz upload da foto e dos documentos no storage;
-   * 3. persiste Worker + Documents (status PENDENTE) em uma transação.
+   * 1. Se CPF já existir na company → usa o Worker existente e cria novo Assignment.
+   * 2. Se CPF é novo → cria Worker + Assignment em transação.
+   * 3. Faz upload da foto e dos documentos no storage.
    */
   async create({
     scope,
@@ -284,14 +344,6 @@ export class WorkerService {
   }: CreateWorkerParams) {
     const companyId = scope.companyId;
     const contractor = await ensureContractorInScope(scope, data.contractorId);
-
-    const duplicate = await prisma.worker.findUnique({
-      where: { obraId_cpf: { obraId: contractor.obraId, cpf: data.cpf } },
-      select: { id: true },
-    });
-    if (duplicate) {
-      throw Conflict("Já existe um colaborador com este CPF nesta obra");
-    }
 
     if (data.functionId) {
       await this.ensureWorkerFunctionBelongsToCompany(companyId, data.functionId);
@@ -304,12 +356,33 @@ export class WorkerService {
       );
     }
 
-    const storage = await getStorage();
-    const qrHash = await this.generateUniqueAccessToken();
+    // Verifica se já existe worker com este CPF na company (multi-obra)
+    const cpfHash = hashCpf(data.cpf);
+    const existingWorker = await prisma.worker.findUnique({
+      where: { companyId_cpfHash: { companyId, cpfHash } },
+      select: { id: true },
+    });
 
-    // Upload da foto (fora da transação — I/O externo).
+    // Se worker já existir, verifica se já tem assignment nesta obra
+    if (existingWorker) {
+      const existingAssignment = await prisma.workerAssignment.findUnique({
+        where: {
+          obraId_workerId: {
+            obraId: contractor.obraId,
+            workerId: existingWorker.id,
+          },
+        },
+        select: { id: true },
+      });
+      if (existingAssignment) {
+        throw Conflict("Colaborador com este CPF já está cadastrado nesta obra");
+      }
+    }
+
+    const storage = await getStorage();
+
     let photoUrl: string | undefined;
-    if (photo) {
+    if (photo && !existingWorker) {
       const stored = await storage.upload({
         buffer: photo.buffer,
         originalName: photo.originalname,
@@ -317,9 +390,20 @@ export class WorkerService {
         folder: `companies/${companyId}/workers/photos`,
       });
       photoUrl = stored.url;
+    } else if (photo && existingWorker) {
+      // Atualiza foto do worker existente
+      const stored = await storage.upload({
+        buffer: photo.buffer,
+        originalName: photo.originalname,
+        mimeType: photo.mimetype,
+        folder: `companies/${companyId}/workers/photos`,
+      });
+      await prisma.worker.update({
+        where: { id: existingWorker.id },
+        data: { photoUrl: stored.url },
+      });
     }
 
-    // Upload dos documentos.
     const uploadedDocs = await Promise.all(
       (documents ?? []).map(async (file, idx) => {
         const meta: DocumentMeta = docsMeta[idx];
@@ -334,68 +418,180 @@ export class WorkerService {
     );
 
     const worker = await prisma.$transaction(async (tx) => {
-      const created = await tx.worker.create({
+      let workerId: string;
+
+      if (existingWorker) {
+        workerId = existingWorker.id;
+      } else {
+        const qrHash = await this.generateUniqueQrHash();
+        const created = await tx.worker.create({
+          data: {
+            companyId,
+            fullName: data.fullName,
+            cpf: encrypt(data.cpf),
+            cpfHash,
+            rg: data.rg ? encrypt(data.rg) : null,
+            birthDate: data.birthDate,
+            email: data.email,
+            phone: data.phone,
+            photoUrl,
+            qrHash,
+          },
+        });
+        workerId = created.id;
+      }
+
+      // Cria o vínculo com a obra
+      const assignment = await tx.workerAssignment.create({
         data: {
           companyId,
+          workerId,
           obraId: contractor.obraId,
           contractorId: data.contractorId,
           functionId: data.functionId,
-          fullName: data.fullName,
-          cpf: data.cpf,
-          rg: data.rg,
-          birthDate: data.birthDate,
-          email: data.email,
-          phone: data.phone,
           role: data.role,
           registration: data.registration,
+          admissionDate: data.admissionDate,
           shiftStart: data.shiftStart,
           shiftEnd: data.shiftEnd,
-          photoUrl,
-          qrHash,
         },
       });
 
-      if (uploadedDocs.length > 0) {
-        await tx.document.createMany({
-          data: uploadedDocs.map(({ file, meta, stored }) => ({
-            companyId,
-            ownerType: DocumentOwnerType.WORKER,
-            workerId: created.id,
-            type: meta.type,
-            title: meta.title,
-            fileUrl: stored.url,
-            fileKey: stored.key,
-            mimeType: file.mimetype,
-            fileSize: file.size,
-            issuedAt: meta.issuedAt,
-            expiresAt: meta.expiresAt,
-            uploadedById: createdById,
-          })),
-        });
-      }
-
       if (data.functionId) {
-        await this.syncWorkerRequirementsFromFunction(tx, {
+        await this.syncFunctionRequirementsToAssignment(tx, {
           companyId,
-          workerId: created.id,
+          workerId,
+          assignmentId: assignment.id,
           functionId: data.functionId,
           createdById,
         });
       }
 
-      return tx.worker.findUniqueOrThrow({
-        where: { id: created.id },
-        include: { documents: true, contractor: true, function: true, requirementItems: true },
+      if (uploadedDocs.length > 0) {
+        const requirementItems = await tx.workerRequirementItem.findMany({
+          where: { companyId, assignmentId: assignment.id },
+          select: { id: true, documentType: true, name: true },
+        });
+        const linkedItemIds = new Set<string>();
+
+        for (const { file, meta, stored } of uploadedDocs) {
+          const matchingItem = this.matchRequirementItem(requirementItems, meta);
+          if (matchingItem) linkedItemIds.add(matchingItem.id);
+
+          const doc = await tx.document.create({
+            data: {
+              companyId,
+              ownerType: DocumentOwnerType.WORKER,
+              workerId,
+              workerRequirementItemId: matchingItem?.id ?? null,
+              type: meta.type,
+              title: meta.title,
+              fileUrl: stored.url,
+              fileKey: stored.key,
+              mimeType: file.mimetype,
+              fileSize: file.size,
+              issuedAt: meta.issuedAt,
+              expiresAt: meta.expiresAt,
+              status: DocumentStatus.PENDENTE,
+              uploadedById: createdById,
+            },
+          });
+
+          if (matchingItem) {
+            await tx.workerRequirementItem.update({
+              where: { id: matchingItem.id },
+              data: {
+                status: RequirementCollectionStatus.PENDING_APPROVAL,
+                naReason: null,
+                latestDocumentId: doc.id,
+              },
+            });
+          }
+        }
+      }
+
+      const w = await tx.worker.findUniqueOrThrow({
+        where: { id: workerId },
+        include: WORKER_FULL_INCLUDE,
       });
+      return decryptWorker(w);
     });
+
+    if (uploadedDocs.length > 0) {
+      await recomputeWorkerRequirements(worker.id);
+    }
 
     return worker;
   }
 
   /**
-   * Importação em lote a partir de linhas de planilha. Resolve empreiteira e
-   * função por nome (case-insensitive), cria a função se não existir e ignora
-   * linhas inválidas/duplicadas retornando um relatório por linha.
+   * Adiciona um colaborador já existente a uma nova obra criando um WorkerAssignment.
+   */
+  async addAssignment(
+    scope: AuthScope,
+    workerId: string,
+    data: CreateAssignmentInput,
+    createdById?: string,
+  ) {
+    const companyId = scope.companyId;
+
+    const worker = await prisma.worker.findFirst({
+      where: { id: workerId, companyId },
+      select: { id: true },
+    });
+    if (!worker) throw NotFound("Colaborador não encontrado");
+
+    const contractor = await ensureContractorInScope(scope, data.contractorId);
+
+    const existing = await prisma.workerAssignment.findUnique({
+      where: { obraId_workerId: { obraId: contractor.obraId, workerId } },
+      select: { id: true },
+    });
+    if (existing) {
+      throw Conflict("Colaborador já possui vínculo com esta obra");
+    }
+
+    if (data.functionId) {
+      await this.ensureWorkerFunctionBelongsToCompany(companyId, data.functionId);
+    }
+
+    return prisma.$transaction(async (tx) => {
+      const assignment = await tx.workerAssignment.create({
+        data: {
+          companyId,
+          workerId,
+          obraId: contractor.obraId,
+          contractorId: data.contractorId,
+          functionId: data.functionId,
+          role: data.role,
+          registration: data.registration,
+          admissionDate: data.admissionDate,
+          shiftStart: data.shiftStart,
+          shiftEnd: data.shiftEnd,
+        },
+        include: {
+          obra: { select: { id: true, name: true } },
+          contractor: { select: { id: true, name: true } },
+          function: { select: { id: true, name: true } },
+        },
+      });
+
+      if (data.functionId) {
+        await this.syncFunctionRequirementsToAssignment(tx, {
+          companyId,
+          workerId,
+          assignmentId: assignment.id,
+          functionId: data.functionId,
+          createdById,
+        });
+      }
+
+      return assignment;
+    });
+  }
+
+  /**
+   * Importação em lote a partir de linhas de planilha.
    */
   async importBatch(
     scope: AuthScope,
@@ -443,26 +639,37 @@ export class WorkerService {
           continue;
         }
 
-        const duplicate = await prisma.worker.findUnique({
-          where: { obraId_cpf: { obraId: contractor.obraId, cpf: data.cpf } },
+        // Verifica duplicidade: mesmo CPF na mesma obra
+        const rowCpfHash = hashCpf(data.cpf);
+        const existingWorker = await prisma.worker.findUnique({
+          where: { companyId_cpfHash: { companyId, cpfHash: rowCpfHash } },
           select: { id: true },
         });
-        if (duplicate) {
-          results.push({
-            line,
-            status: "error",
-            message: "CPF já cadastrado",
-            fullName: data.fullName,
+        if (existingWorker) {
+          const existingAssignment = await prisma.workerAssignment.findUnique({
+            where: {
+              obraId_workerId: {
+                obraId: contractor.obraId,
+                workerId: existingWorker.id,
+              },
+            },
+            select: { id: true },
           });
-          continue;
+          if (existingAssignment) {
+            results.push({
+              line,
+              status: "error",
+              message: "CPF já cadastrado nesta obra",
+              fullName: data.fullName,
+            });
+            continue;
+          }
         }
 
         let functionId: string | undefined;
         if (data.functionName) {
           const fn = await prisma.workerFunction.upsert({
-            where: {
-              companyId_name: { companyId, name: data.functionName },
-            },
+            where: { companyId_name: { companyId, name: data.functionName } },
             update: {},
             create: { companyId, name: data.functionName },
             select: { id: true },
@@ -484,6 +691,7 @@ export class WorkerService {
             phone: data.phone,
             role: data.role,
             registration: data.registration,
+            admissionDate: undefined,
             shiftStart: undefined,
             shiftEnd: undefined,
             documentsMeta: [],
@@ -507,37 +715,44 @@ export class WorkerService {
   async findById(scope: AuthScope, id: string) {
     const worker = await prisma.worker.findFirst({
       where: { id, ...workerScopeWhere(scope) },
-      include: {
-        documents: true,
-        contractor: true,
-        function: true,
-        requirementItems: true,
-        obra: { select: { id: true, name: true } },
+      include: WORKER_FULL_INCLUDE,
+    });
+    if (!worker) throw NotFound("Colaborador não encontrado");
+    return decryptWorker(worker);
+  }
+
+  /** Retorna o assignment primário do escopo atual (para PATCH legado do frontend). */
+  async resolvePrimaryAssignmentId(scope: AuthScope, workerId: string) {
+    const worker = await prisma.worker.findFirst({
+      where: { id: workerId, ...workerScopeWhere(scope) },
+      select: {
+        assignments: {
+          select: { id: true, obraId: true },
+          orderBy: { createdAt: "asc" },
+        },
       },
     });
     if (!worker) throw NotFound("Colaborador não encontrado");
-    return worker;
+    return pickPrimaryAssignment(worker.assignments, scope)?.id ?? null;
   }
 
   async list(scope: AuthScope, query: ListWorkersQuery) {
     const cpfDigits = query.cpf?.replace(/\D/g, "") || undefined;
-    const baseScope = workerScopeWhere(scope);
+    const { companyId, obraIds, activeObraId } = scope;
 
-    // Pré-filtra IDs por texto (nome/RG/matrícula/email) usando unaccent.
-    const textFilters: Array<{ field: "fullName" | "rg" | "registration" | "email"; raw: string }> = [];
+    // Pré-filtra IDs por texto usando unaccent
+    const textFilters: Array<{ field: "fullName" | "rg" | "email"; raw: string }> = [];
     if (query.name) textFilters.push({ field: "fullName", raw: query.name });
-    if (query.rg) textFilters.push({ field: "rg", raw: query.rg });
-    if (query.registration)
-      textFilters.push({ field: "registration", raw: query.registration });
+    // rg não é pesquisável quando criptografia de campo está ativa
+    if (query.rg && !env.ENCRYPTION_KEY) textFilters.push({ field: "rg", raw: query.rg });
     if (query.email) textFilters.push({ field: "email", raw: query.email });
 
     let textIds: string[] | null = null;
     if (textFilters.length > 0) {
       textIds = await workerIdsMatchingText({
-        scopeWhere: {
-          companyId: scope.companyId,
-          obraId: (baseScope as { obraId?: unknown }).obraId,
-        },
+        companyId,
+        obraIds,
+        activeObraId,
         filters: textFilters,
       });
       if (textIds.length === 0) {
@@ -548,14 +763,11 @@ export class WorkerService {
       }
     }
 
-    // Busca global (campo único): pré-filtra IDs por OR sobre nome/matrícula/QR
-    // e mais um EQUAL no CPF/dígitos.
     if (query.search) {
       const globalIds = await workerIdsMatchingGlobal({
-        scopeWhere: {
-          companyId: scope.companyId,
-          obraId: (baseScope as { obraId?: unknown }).obraId,
-        },
+        companyId,
+        obraIds,
+        activeObraId,
         raw: query.search,
       });
       if (globalIds.length === 0) {
@@ -564,10 +776,9 @@ export class WorkerService {
           pagination: { page: query.page, pageSize: query.pageSize, total: 0, totalPages: 0 },
         };
       }
-      textIds =
-        textIds === null
-          ? globalIds
-          : textIds.filter((id) => globalIds.includes(id));
+      textIds = textIds === null
+        ? globalIds
+        : textIds.filter((id) => globalIds.includes(id));
       if (textIds.length === 0) {
         return {
           items: [],
@@ -576,12 +787,30 @@ export class WorkerService {
       }
     }
 
+    // Filtro de assignment para scoping por obra/empreiteira/status
+    const assignmentFilter: Prisma.WorkerAssignmentWhereInput =
+      assignmentScopeWhere(scope);
+    if (query.contractorId) assignmentFilter.contractorId = query.contractorId;
+    if (query.functionId) assignmentFilter.functionId = query.functionId;
+    if (query.status) assignmentFilter.status = query.status;
+    if (query.registration?.trim()) {
+      assignmentFilter.registration = {
+        contains: query.registration.trim(),
+        mode: "insensitive",
+      };
+    }
+
     const where: Prisma.WorkerWhereInput = {
-      ...baseScope,
-      ...(query.contractorId ? { contractorId: query.contractorId } : {}),
-      ...(query.functionId ? { functionId: query.functionId } : {}),
-      ...(query.status ? { status: query.status } : {}),
-      ...(cpfDigits ? { cpf: { contains: cpfDigits } } : {}),
+      companyId,
+      assignments: { some: assignmentFilter },
+      // Busca por CPF: partial match em texto plano ou exact match via hash quando criptografado
+      ...(cpfDigits
+        ? env.ENCRYPTION_KEY
+          ? cpfDigits.length === 11
+            ? { cpfHash: hashCpf(cpfDigits) }
+            : {}
+          : { cpf: { contains: cpfDigits } }
+        : {}),
       ...(query.hasPhoto === true ? { photoUrl: { not: null } } : {}),
       ...(query.hasPhoto === false ? { photoUrl: null } : {}),
       ...(query.createdFrom || query.createdTo
@@ -595,8 +824,13 @@ export class WorkerService {
       ...(textIds !== null ? { id: { in: textIds } } : {}),
       ...(query.effectiveStatus?.length
         ? {
-            requirementItems: {
-              some: { effectiveStatus: { in: query.effectiveStatus } },
+            assignments: {
+              some: {
+                ...assignmentFilter,
+                requirementItems: {
+                  some: { effectiveStatus: { in: query.effectiveStatus } },
+                },
+              },
             },
           }
         : {}),
@@ -606,27 +840,34 @@ export class WorkerService {
       prisma.worker.count({ where }),
       prisma.worker.findMany({
         where,
-        include: {
-          contractor: { select: { id: true, name: true } },
-          obra: { select: { id: true, name: true } },
-          // Apenas o status efetivo é necessário no front (chips/filtros).
-          requirementItems: { select: { effectiveStatus: true } },
-        },
+        include: WORKER_LIST_INCLUDE,
         orderBy: { createdAt: "desc" },
         skip: (query.page - 1) * query.pageSize,
         take: query.pageSize,
       }),
     ]);
 
-    // Filtro de turno é feito em memória — comparar duas colunas string da
-    // mesma linha no Prisma exigiria raw SQL; o pós-filtro é simples e barato
-    // dentro do pageSize (máx. 1000).
-    const filteredItems = query.shift
-      ? items.filter((w) => matchesShift(w.shiftStart, w.shiftEnd, query.shift!))
-      : items;
+    // Filtro de turno em memória — avalia o assignment ativo no escopo
+    let filteredItems = items;
+    if (query.shift) {
+      filteredItems = items.filter((w) => {
+        const relevantAssignment = w.assignments.find((a) =>
+          scope.activeObraId
+            ? a.obraId === scope.activeObraId
+            : scope.obraIds.includes(a.obraId),
+        );
+        return relevantAssignment
+          ? matchesShift(
+              relevantAssignment.shiftStart,
+              relevantAssignment.shiftEnd,
+              query.shift!,
+            )
+          : false;
+      });
+    }
 
     return {
-      items: filteredItems,
+      items: filteredItems.map(decryptWorker),
       pagination: {
         page: query.page,
         pageSize: query.pageSize,
@@ -636,58 +877,81 @@ export class WorkerService {
     };
   }
 
+  /** Atualiza dados pessoais (não altera vínculos com obras). */
   async update(scope: AuthScope, id: string, data: UpdateWorkerInput) {
+    await this.findById(scope, id);
+    const updated = await prisma.worker.update({
+      where: { id },
+      data: {
+        ...data,
+        ...(data.rg !== undefined ? { rg: data.rg ? encrypt(data.rg) : null } : {}),
+      },
+      include: WORKER_FULL_INCLUDE,
+    });
+    return decryptWorker(updated);
+  }
+
+  /** Atualiza um vínculo específico (WorkerAssignment). */
+  async updateAssignment(
+    scope: AuthScope,
+    workerId: string,
+    assignmentId: string,
+    data: UpdateAssignmentInput,
+  ) {
     const companyId = scope.companyId;
-    const existing = await this.findById(scope, id);
+    await this.findById(scope, workerId);
+
+    const assignment = await prisma.workerAssignment.findFirst({
+      where: { id: assignmentId, workerId, companyId },
+      select: { id: true, functionId: true },
+    });
+    if (!assignment) throw NotFound("Vínculo não encontrado");
+
+    if (data.contractorId) {
+      await ensureContractorInScope(scope, data.contractorId);
+    }
 
     const nextFunctionId =
-      data.functionId === undefined ? existing.functionId : data.functionId;
+      data.functionId === undefined ? assignment.functionId : data.functionId;
     if (nextFunctionId) {
       await this.ensureWorkerFunctionBelongsToCompany(companyId, nextFunctionId);
     }
 
-    // Quando o contractorId muda, busca a obra da nova empreiteira para
-    // manter worker.obraId em sincronia (worker pertence à obra do seu contractor).
-    let newObraId: string | undefined;
-    if (data.contractorId && data.contractorId !== existing.contractorId) {
-      const contractor = await prisma.contractor.findFirst({
-        where: { id: data.contractorId, companyId },
-        select: { id: true, obraId: true },
-      });
-      if (!contractor) throw NotFound("Empreiteira não encontrada");
-      newObraId = contractor.obraId;
-    }
-
-    const worker = await prisma.$transaction(async (tx) => {
-      const updated = await tx.worker.update({
-        where: { id },
+    return prisma.$transaction(async (tx) => {
+      const updated = await tx.workerAssignment.update({
+        where: { id: assignmentId },
         data: {
-          ...data,
-          ...(newObraId ? { obraId: newObraId } : {}),
+          ...(data.contractorId !== undefined ? { contractorId: data.contractorId } : {}),
+          ...(data.functionId !== undefined ? { functionId: data.functionId } : {}),
+          ...(data.role !== undefined ? { role: data.role } : {}),
+          ...(data.registration !== undefined ? { registration: data.registration } : {}),
+          ...(data.admissionDate !== undefined ? { admissionDate: data.admissionDate } : {}),
+          ...(data.shiftStart !== undefined ? { shiftStart: data.shiftStart } : {}),
+          ...(data.shiftEnd !== undefined ? { shiftEnd: data.shiftEnd } : {}),
+          ...(data.status !== undefined ? { status: data.status } : {}),
         },
         include: {
-          documents: true,
-          contractor: true,
-          function: true,
-          requirementItems: true,
+          obra: { select: { id: true, name: true } },
+          contractor: { select: { id: true, name: true } },
+          function: { select: { id: true, name: true } },
+          requirementItems: { select: { effectiveStatus: true } },
         },
       });
 
-      if (nextFunctionId) {
-        await this.syncWorkerRequirementsFromFunction(tx, {
+      if (nextFunctionId && nextFunctionId !== assignment.functionId) {
+        await this.syncFunctionRequirementsToAssignment(tx, {
           companyId,
-          workerId: id,
+          workerId,
+          assignmentId,
           functionId: nextFunctionId,
         });
       }
 
       return updated;
     });
-
-    return worker;
   }
 
-  /** Atualiza apenas a foto do colaborador (upload no storage). */
+  /** Atualiza apenas a foto do colaborador. */
   async updatePhoto(scope: AuthScope, id: string, photo: UploadedFile) {
     const companyId = scope.companyId;
     await this.findById(scope, id);
@@ -698,33 +962,31 @@ export class WorkerService {
       mimeType: photo.mimetype,
       folder: `companies/${companyId}/workers/photos`,
     });
-    return prisma.worker.update({
+    const updated = await prisma.worker.update({
       where: { id },
       data: { photoUrl: stored.url },
-      include: { documents: true, contractor: true, function: true, requirementItems: true },
+      include: WORKER_FULL_INCLUDE,
     });
+    return decryptWorker(updated);
   }
 
   /**
-   * Contadores do "funil" — quantas exigências há em cada situação efetiva,
-   * dentro do escopo (obra) do usuário. Alimenta os indicadores e a navegação
-   * por situação. Uma única query agregada (groupBy), escala com 1000+.
+   * Contadores do funil — exigências por situação efetiva no escopo do usuário.
    */
   async requirementsSummary(scope: AuthScope) {
+    const assignmentScope = assignmentScopeWhere(scope);
     const grouped = await prisma.workerRequirementItem.groupBy({
       by: ["effectiveStatus"],
-      where: { companyId: scope.companyId, worker: workerScopeWhere(scope) },
+      where: {
+        companyId: scope.companyId,
+        assignment: assignmentScope,
+      },
       _count: { _all: true },
     });
 
     const counts: Record<string, number> = {
-      EM_FALTA: 0,
-      AGUARDANDO: 0,
-      REPROVADO: 0,
-      VENCIDO: 0,
-      PROX_VENCIMENTO: 0,
-      VIGENTE: 0,
-      NA: 0,
+      EM_FALTA: 0, AGUARDANDO: 0, REPROVADO: 0,
+      VENCIDO: 0, PROX_VENCIMENTO: 0, VIGENTE: 0, NA: 0,
     };
     for (const g of grouped) counts[g.effectiveStatus] = g._count._all;
 
@@ -735,24 +997,23 @@ export class WorkerService {
   }
 
   /**
-   * Lista todas as exigências de todos os colaboradores no escopo,
-   * com filtros por effectiveStatus, contractorId e workerId.
-   * Alimenta a aba Pendentes do portal.
+   * Lista todas as exigências no escopo (aba Pendentes).
    */
   async listAllRequirements(scope: AuthScope, query: ListAllRequirementsQuery) {
     const { companyId } = scope;
-    const scopeWhere = workerScopeWhere(scope);
+    const assignmentScope = assignmentScopeWhere(scope);
 
-    const where = {
+    const where: Prisma.WorkerRequirementItemWhereInput = {
       companyId,
-      worker: scopeWhere,
+      assignment: assignmentScope,
       ...(query.effectiveStatus?.length
         ? { effectiveStatus: { in: query.effectiveStatus } }
         : {}),
       ...(query.contractorId
-        ? { worker: { ...scopeWhere, contractorId: query.contractorId } }
+        ? { assignment: { ...assignmentScope, contractorId: query.contractorId } }
         : {}),
       ...(query.workerId ? { workerId: query.workerId } : {}),
+      ...(query.assignmentId ? { assignmentId: query.assignmentId } : {}),
     };
 
     const [total, items] = await Promise.all([
@@ -764,6 +1025,11 @@ export class WorkerService {
             select: {
               id: true,
               fullName: true,
+            },
+          },
+          assignment: {
+            select: {
+              id: true,
               role: true,
               contractor: { select: { id: true, name: true } },
               obra: { select: { id: true, name: true } },
@@ -800,11 +1066,15 @@ export class WorkerService {
     };
   }
 
-  async listRequirements(scope: AuthScope, workerId: string) {
+  async listRequirements(scope: AuthScope, workerId: string, assignmentId?: string) {
     const companyId = scope.companyId;
     await this.findById(scope, workerId);
     return prisma.workerRequirementItem.findMany({
-      where: { companyId, workerId },
+      where: {
+        companyId,
+        workerId,
+        ...(assignmentId ? { assignmentId } : {}),
+      },
       include: {
         requirement: {
           select: {
@@ -815,6 +1085,9 @@ export class WorkerService {
             monthlyDueDay: true,
             referenceDate: true,
           },
+        },
+        assignment: {
+          select: { id: true, obraId: true, obra: { select: { id: true, name: true } } },
         },
         latestDocument: {
           select: {
@@ -844,14 +1117,25 @@ export class WorkerService {
   ) {
     const companyId = scope.companyId;
     await this.findById(scope, workerId);
+
     if (data.frequency === RequirementFrequency.MONTHLY && !data.monthlyDueDay) {
       throw BadRequest("Para cobrança mensal, informe `monthlyDueDay` (1-31).");
+    }
+
+    // Valida assignmentId se informado
+    if (data.assignmentId) {
+      const assignment = await prisma.workerAssignment.findFirst({
+        where: { id: data.assignmentId, workerId, companyId },
+        select: { id: true },
+      });
+      if (!assignment) throw NotFound("Vínculo não encontrado");
     }
 
     const created = await prisma.workerRequirementItem.create({
       data: {
         companyId,
         workerId,
+        assignmentId: data.assignmentId,
         source: RequirementSource.MANUAL,
         status: RequirementCollectionStatus.NOT_SENT,
         name: data.name,
@@ -899,6 +1183,60 @@ export class WorkerService {
     });
     await recomputeRequirementItem(itemId);
     return updated;
+  }
+
+  /**
+   * Anonimização de dados pessoais (LGPD Art. 18 — Direito ao Apagamento).
+   *
+   * Substitui CPF, RG, nome, e-mail, telefone e foto por valores neutros/nulos.
+   * Inativa todos os vínculos do colaborador.
+   * Os registros de acesso (audit trail de entrada/saída) são mantidos para fins
+   * legais e de segurança do trabalho, mas o worker fica sem dados identificáveis.
+   */
+  async anonymize(scope: AuthScope, id: string, requestedById: string) {
+    const companyId = scope.companyId;
+
+    const worker = await prisma.worker.findFirst({
+      where: { id, companyId },
+      select: { id: true, anonymizedAt: true },
+    });
+    if (!worker) throw NotFound("Colaborador não encontrado");
+    if (worker.anonymizedAt) {
+      throw Conflict("Dados deste colaborador já foram anonimizados.");
+    }
+
+    const anonymousCpfHash = hashCpf(`ANON-${id}`);
+
+    await prisma.$transaction(async (tx) => {
+      // Substitui dados identificáveis
+      await tx.worker.update({
+        where: { id },
+        data: {
+          fullName: "Colaborador Removido",
+          cpf: `ANON-${id}`,
+          cpfHash: anonymousCpfHash,
+          rg: null,
+          birthDate: null,
+          email: null,
+          phone: null,
+          photoUrl: null,
+          anonymizedAt: new Date(),
+        },
+      });
+
+      // Inativa todos os vínculos com obras
+      await tx.workerAssignment.updateMany({
+        where: { workerId: id, companyId },
+        data: { status: "INACTIVE" },
+      });
+    });
+
+    return {
+      success: true,
+      message:
+        "Dados pessoais anonimizados conforme LGPD Art. 18. " +
+        "Registros de acesso mantidos para fins legais.",
+    };
   }
 }
 

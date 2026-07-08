@@ -4,6 +4,8 @@ import { requirementsService } from "./requirements.service.js";
 import {
   contractorTypeUpsertSchema,
   copyRequirementsSchema,
+  definitionAccessSchema,
+  importRowsSchema,
   listDefinitionQuerySchema,
   requirementDefinitionUpsertSchema,
   workerFunctionUpsertSchema,
@@ -86,6 +88,47 @@ export const requirementsController = {
       data,
     );
     res.json(item);
+  },
+
+  async getDefinitionAccess(req: Request, res: Response) {
+    const companyId = companyIdFrom(req);
+    const result = await requirementsService.getDefinitionAccess(
+      companyId,
+      String(req.params.id),
+    );
+    res.json(result);
+  },
+
+  async setDefinitionAccess(req: Request, res: Response) {
+    const companyId = companyIdFrom(req);
+    const data = definitionAccessSchema.parse(req.body);
+    const result = await requirementsService.setDefinitionAccess(
+      companyId,
+      String(req.params.id),
+      data,
+    );
+    res.json(result);
+  },
+
+  async importWorkerFunctions(req: Request, res: Response) {
+    const companyId = companyIdFrom(req);
+    const data = importRowsSchema.parse(req.body);
+    const result = await requirementsService.importWorkerFunctions(companyId, data.rows);
+    res.status(201).json(result);
+  },
+
+  async importContractorTypes(req: Request, res: Response) {
+    const companyId = companyIdFrom(req);
+    const data = importRowsSchema.parse(req.body);
+    const result = await requirementsService.importContractorTypes(companyId, data.rows);
+    res.status(201).json(result);
+  },
+
+  async importDefinitions(req: Request, res: Response) {
+    const companyId = companyIdFrom(req);
+    const data = importRowsSchema.parse(req.body);
+    const result = await requirementsService.importDefinitions(companyId, data.rows);
+    res.status(201).json(result);
   },
 
   async copyWorkerFunctionRequirements(req: Request, res: Response) {

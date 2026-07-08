@@ -27,7 +27,7 @@ const permissionsSchema = z.array(z.string()).optional();
 const createSchema = z.object({
   name: z.string().trim().min(2),
   email: z.string().trim().email(),
-  password: z.string().min(4, "Senha deve ter ao menos 4 caracteres"),
+  password: z.string().min(8, "Senha deve ter ao menos 8 caracteres"),
   profile: z.nativeEnum(UserProfile).default(UserProfile.USER),
   contractorId: z.string().optional(),
   obraIds: z.array(z.string().min(1)).optional(),
@@ -37,7 +37,7 @@ const createSchema = z.object({
 
 const updateSchema = z.object({
   name: z.string().trim().min(2).optional(),
-  password: z.string().min(4).optional(),
+  password: z.string().min(8, "Senha deve ter ao menos 8 caracteres").optional(),
   profile: z.nativeEnum(UserProfile).optional(),
   contractorId: z.string().nullable().optional(),
   obraIds: z.array(z.string().min(1)).optional(),

@@ -3,6 +3,8 @@ import PDFDocument from "pdfkit";
 import QRCode from "qrcode";
 import sharp from "sharp";
 import { prisma } from "../../lib/prisma.js";
+import { signLocalFileUrl } from "../../lib/file-signing.js";
+import { workerScopeWhere, type AuthScope } from "../../lib/scope.js";
 import { badgeService } from "../badge/badge.service.js";
 
 // Badge: 57×89 mm → pontos PDF (1 pt = 1/72 pol)
@@ -77,7 +79,8 @@ async function gerarQrBuffer(valor: string): Promise<Buffer> {
 
 async function baixarFoto(url: string): Promise<Buffer | undefined> {
   try {
-    const res = await fetch(url);
+    // URLs do storage local agora exigem assinatura — assina antes de baixar.
+    const res = await fetch(signLocalFileUrl(url));
     if (!res.ok) return undefined;
     return Buffer.from(await res.arrayBuffer());
   } catch {
@@ -247,9 +250,9 @@ function adicionarPagina(
 export async function gerarPorWorker(
   templateBuf: Buffer,
   workerId: string,
-  companyId: string,
+  scope: AuthScope,
 ): Promise<Buffer> {
-  const payload = await badgeService.generate(companyId, workerId);
+  const payload = await badgeService.generate(scope, workerId);
 
   const fotoBuf = payload.worker.photoUrl
     ? await baixarFoto(payload.worker.photoUrl)
@@ -271,10 +274,10 @@ export async function gerarPorWorker(
   return done;
 }
 
-/** Gera PDF em lote para todos (ou os selecionados) colaboradores ativos da empresa. */
+/** Gera PDF em lote para todos (ou os selecionados) colaboradores ativos do escopo. */
 export async function gerarLote(
   templateBuf: Buffer,
-  companyId: string,
+  scope: AuthScope,
   workerIds?: string[],
 ): Promise<Buffer> {
   const ids =
@@ -282,7 +285,7 @@ export async function gerarLote(
       ? workerIds
       : (
           await prisma.worker.findMany({
-            where: { companyId, status: "ACTIVE" },
+            where: { ...workerScopeWhere(scope), status: "ACTIVE" },
             select: { id: true },
             orderBy: { fullName: "asc" },
           })
@@ -295,7 +298,7 @@ export async function gerarLote(
 
   for (const id of ids) {
     try {
-      const payload = await badgeService.generate(companyId, id);
+      const payload = await badgeService.generate(scope, id);
       const fotoBuf = payload.worker.photoUrl
         ? await baixarFoto(payload.worker.photoUrl)
         : undefined;

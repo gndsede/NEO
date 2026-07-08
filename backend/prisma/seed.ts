@@ -24,8 +24,14 @@ async function main() {
     },
   });
 
-  // Usuário admin (login: admin@accesshub.dev / senha: admin123)
-  const passwordHash = await bcrypt.hash("admin123", 10);
+  // Usuário admin de desenvolvimento — senha via env (SEED_ADMIN_PASSWORD).
+  const seedPassword = process.env.SEED_ADMIN_PASSWORD;
+  if (!seedPassword || seedPassword.length < 8) {
+    throw new Error(
+      "Defina SEED_ADMIN_PASSWORD (mínimo 8 caracteres) no ambiente para rodar o seed.",
+    );
+  }
+  const passwordHash = await bcrypt.hash(seedPassword, 10);
   const allPermissions = [
     "dashboard.view",
     "obras.view",

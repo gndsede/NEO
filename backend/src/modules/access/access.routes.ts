@@ -20,11 +20,8 @@ import {
 import { rewritePublicUrl } from "../../lib/public-url.js";
 import { resolveNextDirection } from "./access.direction.js";
 
-const NR_TYPES: DocumentType[] = [
-  DocumentType.NR_10,
-  DocumentType.NR_18,
-  DocumentType.NR_35,
-];
+const NR_TITLE_PATTERN = /\bNR[\s-]?(10|18|35)\b/i;
+const ASO_TITLE_PATTERN = /\bASO\b/i;
 
 function pickEarliest(dates: Array<Date | null | undefined>): Date | null {
   const valid = dates.filter((d): d is Date => d instanceof Date);
@@ -40,14 +37,10 @@ const PENDING_REQUIREMENT_STATUSES: RequirementCollectionStatus[] = [
 
 function statusLabel(status: RequirementCollectionStatus): string {
   switch (status) {
-    case RequirementCollectionStatus.NOT_SENT:
-      return "não enviado";
-    case RequirementCollectionStatus.PENDING_APPROVAL:
-      return "aguardando aprovação";
-    case RequirementCollectionStatus.REJECTED:
-      return "rejeitado";
-    default:
-      return status;
+    case RequirementCollectionStatus.NOT_SENT: return "não enviado";
+    case RequirementCollectionStatus.PENDING_APPROVAL: return "aguardando aprovação";
+    case RequirementCollectionStatus.REJECTED: return "rejeitado";
+    default: return status;
   }
 }
 
@@ -59,22 +52,23 @@ interface PendingRequirementSummary {
   statusLabel: string;
 }
 
+/**
+ * Busca pendências de um colaborador, opcionalmente filtradas por assignmentId
+ * (para verificar somente os requisitos da obra específica da portaria).
+ */
 async function fetchPendingRequirements(
   companyId: string,
   workerId: string,
+  assignmentId?: string,
 ): Promise<PendingRequirementSummary[]> {
   const items = await prisma.workerRequirementItem.findMany({
     where: {
       companyId,
       workerId,
+      ...(assignmentId ? { assignmentId } : {}),
       status: { in: PENDING_REQUIREMENT_STATUSES },
     },
-    select: {
-      id: true,
-      name: true,
-      documentType: true,
-      status: true,
-    },
+    select: { id: true, name: true, documentType: true, status: true },
     orderBy: [{ status: "asc" }, { name: "asc" }],
   });
   return items.map((i) => ({
@@ -93,11 +87,6 @@ function formatPendingReason(items: PendingRequirementSummary[]): string {
   return `Documentação pendente: ${list}`;
 }
 
-/**
- * Cria um AccessLog persistindo `clientId` para idempotência do batch offline.
- * Se uma corrida criar um log com o mesmo clientId entre a checagem inicial e
- * o insert (Prisma P2002), recupera o registro existente em vez de duplicar.
- */
 async function createBatchLog(params: {
   companyId: string;
   clientId?: string;
@@ -132,13 +121,7 @@ function companyId(req: Request): string {
 }
 
 const scanSchema = z.object({
-  /** Conteúdo lido do QR Code (token NEO- ou URL com ?t=). */
   qr: z.string().min(1),
-  /**
-   * Direção desejada. Se omitido (recomendado), o servidor decide pela paridade
-   * dos scans anteriores: ENTRY se o último foi EXIT ou se não há histórico,
-   * EXIT se o último foi ENTRY.
-   */
   direction: z.nativeEnum(AccessDirection).optional(),
   gate: z.string().optional(),
   override: z.boolean().optional(),
@@ -150,7 +133,6 @@ router.post(
   asyncHandler(async (req, res) => {
     const company = companyId(req);
     const { qr, direction: requestedDirection, gate, override } = scanSchema.parse(req.body);
-
     const token = normalizeScannedQr(qr);
 
     const deny = async (
@@ -171,66 +153,102 @@ router.post(
           operatorId: req.user!.id,
         },
       });
-      return res.status(403).json({
-        result: "DENIED",
-        reason,
-        direction: directionForLog,
-        log,
-        ...extra,
-      });
+      return res.status(403).json({ result: "DENIED", reason, direction: directionForLog, log, ...extra });
     };
 
     if (!isValidNeoAccessToken(token)) {
       return deny("QR inválido — formato esperado: NEO-0A0AA0");
     }
 
+    // Busca o colaborador pelo token
     const worker = await prisma.worker.findFirst({
       where: { qrHash: token, companyId: company },
       include: {
         documents: {
-          select: {
-            id: true,
-            type: true,
-            title: true,
-            status: true,
-            expiresAt: true,
-            issuedAt: true,
-          },
+          select: { id: true, type: true, title: true, status: true, expiresAt: true, issuedAt: true },
           orderBy: { issuedAt: "desc" },
         },
-        contractor: { select: { id: true, name: true } },
-        function: { select: { id: true, name: true } },
-        obra: { select: { id: true, name: true } },
       },
     });
 
-    if (!worker) return deny("Colaborador não encontrado", undefined);
+    if (!worker) return deny("Colaborador não encontrado");
 
     const direction =
       requestedDirection ??
       (await resolveNextDirection({ companyId: company, workerId: worker.id }));
 
-    // Colaborador precisa pertencer à obra que o porteiro escolheu no app.
-    const activeObraId = req.user!.activeObraId;
-    if (activeObraId && worker.obraId !== activeObraId) {
-      return deny(
-        `Colaborador é da obra "${worker.obra.name}" — esta portaria opera outra obra.`,
-        worker.id,
-        direction,
-        {
-          workerObra: { id: worker.obra.id, name: worker.obra.name },
-        },
-      );
+    // Anti-passback estrito: bloqueia ENTRY duplicado sem EXIT intermediário.
+    // Aplica quando a direção é ENTRY (auto-resolvida ou explícita) e o último
+    // acesso GRANTED registrado também foi ENTRY — indica badge compartilhado ou
+    // entrada sem registrar saída.
+    if (!override && direction === AccessDirection.ENTRY) {
+      const lastGranted = await prisma.accessLog.findFirst({
+        where: { companyId: company, workerId: worker.id, result: AccessResult.GRANTED },
+        orderBy: { occurredAt: "desc" },
+        select: { direction: true },
+      });
+      if (lastGranted?.direction === AccessDirection.ENTRY) {
+        return deny(
+          "Anti-passback: colaborador está com entrada registrada sem saída correspondente.",
+          worker.id,
+          direction,
+          { antiPassback: true },
+        );
+      }
     }
 
-    if (worker.status === WorkerStatus.BLOCKED)
-      return deny("Colaborador bloqueado", worker.id, direction);
-    if (worker.status === WorkerStatus.INACTIVE)
-      return deny("Colaborador inativo", worker.id, direction);
+    // Verifica assignment na obra ativa da portaria
+    const activeObraId = req.user!.activeObraId;
+    let assignment: { id: string; status: string; accessValidUntil: Date | null; role: string; registration: string | null; contractor: { id: string; name: string }; function: { id: string; name: string } | null; } | null = null;
 
+    if (activeObraId) {
+      assignment = await prisma.workerAssignment.findUnique({
+        where: { obraId_workerId: { obraId: activeObraId, workerId: worker.id } },
+        include: {
+          contractor: { select: { id: true, name: true } },
+          function: { select: { id: true, name: true } },
+        },
+      });
+
+      if (!assignment) {
+        // Colaborador não tem vínculo com esta obra específica
+        const allAssignments = await prisma.workerAssignment.findMany({
+          where: { workerId: worker.id, companyId: company },
+          include: { obra: { select: { name: true } } },
+          take: 3,
+        });
+        const obraNames = allAssignments.map((a) => a.obra.name).join(", ");
+        return deny(
+          `Colaborador não tem vínculo com esta obra. Obras cadastradas: ${obraNames || "nenhuma"}.`,
+          worker.id,
+          direction,
+        );
+      }
+    } else {
+      // Sem obra ativa → busca qualquer assignment ativo
+      assignment = await prisma.workerAssignment.findFirst({
+        where: { workerId: worker.id, companyId: company, status: WorkerStatus.ACTIVE },
+        include: {
+          contractor: { select: { id: true, name: true } },
+          function: { select: { id: true, name: true } },
+        },
+      });
+    }
+
+    if (!assignment) {
+      return deny("Colaborador sem vínculo ativo com nenhuma obra", worker.id, direction);
+    }
+
+    if (assignment.status === WorkerStatus.BLOCKED)
+      return deny("Colaborador bloqueado nesta obra", worker.id, direction);
+    if (assignment.status === WorkerStatus.INACTIVE)
+      return deny("Colaborador inativo nesta obra", worker.id, direction);
+
+    // Verifica pendências scoped ao assignment desta obra
     const pendingRequirements = await fetchPendingRequirements(
       company,
       worker.id,
+      assignment.id,
     );
     if (!override && pendingRequirements.length > 0) {
       return deny(
@@ -243,7 +261,7 @@ router.post(
 
     if (!override && worker.documents.some((d) => d.status === DocumentStatus.REJEITADO))
       return deny("Documentação rejeitada", worker.id, direction);
-    if (!override && worker.accessValidUntil && worker.accessValidUntil < new Date())
+    if (!override && assignment.accessValidUntil && assignment.accessValidUntil < new Date())
       return deny("Documentação vencida", worker.id, direction);
 
     let log;
@@ -286,12 +304,17 @@ router.post(
     }
 
     const aso = worker.documents.find(
-      (d) => d.type === DocumentType.ASO && d.status === DocumentStatus.APROVADO,
+      (d) =>
+        d.type === DocumentType.SAFETY &&
+        d.status === DocumentStatus.APROVADO &&
+        ASO_TITLE_PATTERN.test(d.title ?? ""),
     );
     const nrs = worker.documents
       .filter(
         (d) =>
-          NR_TYPES.includes(d.type) && d.status === DocumentStatus.APROVADO,
+          d.type === DocumentType.SAFETY &&
+          d.status === DocumentStatus.APROVADO &&
+          NR_TITLE_PATTERN.test(d.title ?? ""),
       )
       .map((d) => ({
         type: d.type,
@@ -306,18 +329,14 @@ router.post(
       worker: {
         id: worker.id,
         fullName: worker.fullName,
-        role: worker.role,
-        registration: worker.registration,
+        role: assignment.role,
+        registration: assignment.registration,
         photoUrl: rewritePublicUrl(worker.photoUrl, req),
-        contractor: worker.contractor,
-        function: worker.function,
-        accessValidUntil: worker.accessValidUntil?.toISOString() ?? null,
+        contractor: assignment.contractor,
+        function: assignment.function,
+        accessValidUntil: assignment.accessValidUntil?.toISOString() ?? null,
         aso: aso
-          ? {
-              title: aso.title,
-              expiresAt: aso.expiresAt?.toISOString() ?? null,
-              issuedAt: aso.issuedAt?.toISOString() ?? null,
-            }
+          ? { title: aso.title, expiresAt: aso.expiresAt?.toISOString() ?? null, issuedAt: aso.issuedAt?.toISOString() ?? null }
           : null,
         nrs,
         nextExpiringDoc: pickEarliest(
@@ -333,12 +352,9 @@ router.post(
 
 const batchScanItemSchema = z.object({
   qr: z.string().min(1),
-  /** Opcional. Quando ausente, o servidor decide por paridade do histórico. */
   direction: z.nativeEnum(AccessDirection).optional(),
   gate: z.string().optional(),
-  /** Timestamp do evento real na portaria (modo offline). */
   occurredAt: z.string().datetime({ offset: true }).optional(),
-  /** ID local gerado pelo app — devolvido na resposta para o app casar com sua fila. */
   clientId: z.string().min(1).max(120).optional(),
   override: z.boolean().optional(),
 });
@@ -347,17 +363,13 @@ const batchScanSchema = z.object({
   items: z.array(batchScanItemSchema).min(1).max(500),
 });
 
-/**
- * Recebe a fila de scans acumulados no modo offline e processa cada um
- * preservando a data real do evento (`occurredAt`). Aplica as mesmas
- * validações do scan unitário e devolve um relatório por item.
- */
 router.post(
   "/scan/batch",
   requireCapability("catraca.manage"),
   asyncHandler(async (req, res) => {
     const company = companyId(req);
     const { items } = batchScanSchema.parse(req.body);
+    const batchActiveObraId = req.user!.activeObraId;
 
     const results = [] as Array<{
       clientId: string | null;
@@ -371,13 +383,9 @@ router.post(
       const token = normalizeScannedQr(item.qr);
       const occurredAt = item.occurredAt ? new Date(item.occurredAt) : new Date();
 
-      // Idempotência: se este clientId já foi processado (reenvio da fila após
-      // resposta perdida), devolve o registro existente sem duplicar o log.
       if (item.clientId) {
         const existing = await prisma.accessLog.findUnique({
-          where: {
-            companyId_clientId: { companyId: company, clientId: item.clientId },
-          },
+          where: { companyId_clientId: { companyId: company, clientId: item.clientId } },
           select: { id: true, result: true, reason: true, workerId: true },
         });
         if (existing) {
@@ -421,56 +429,59 @@ router.post(
       };
 
       if (!isValidNeoAccessToken(token)) {
-        await recordDeny(
-          "QR inválido — formato esperado: NEO-0A0AA0",
-          item.direction ?? AccessDirection.ENTRY,
-        );
+        await recordDeny("QR inválido — formato esperado: NEO-0A0AA0", item.direction ?? AccessDirection.ENTRY);
         continue;
       }
 
       const worker = await prisma.worker.findFirst({
         where: { qrHash: token, companyId: company },
-        include: {
-          documents: { select: { status: true } },
-          obra: { select: { id: true, name: true } },
-        },
+        include: { documents: { select: { status: true } } },
       });
 
       if (!worker) {
-        await recordDeny(
-          "Colaborador não encontrado",
-          item.direction ?? AccessDirection.ENTRY,
-        );
+        await recordDeny("Colaborador não encontrado", item.direction ?? AccessDirection.ENTRY);
         continue;
       }
 
       const direction =
         item.direction ??
-        (await resolveNextDirection({
-          companyId: company,
-          workerId: worker.id,
-        }));
+        (await resolveNextDirection({ companyId: company, workerId: worker.id }));
 
-      const batchActiveObraId = req.user!.activeObraId;
-      if (batchActiveObraId && worker.obraId !== batchActiveObraId) {
-        await recordDeny(
-          `Colaborador é da obra "${worker.obra.name}" — esta portaria opera outra obra.`,
-          direction,
-          worker.id,
-        );
+      // Busca assignment na obra desta portaria
+      let assignment: { id: string; status: string; accessValidUntil: Date | null } | null = null;
+
+      if (batchActiveObraId) {
+        assignment = await prisma.workerAssignment.findUnique({
+          where: { obraId_workerId: { obraId: batchActiveObraId, workerId: worker.id } },
+          select: { id: true, status: true, accessValidUntil: true },
+        });
+
+        if (!assignment) {
+          await recordDeny("Colaborador não tem vínculo com esta obra", direction, worker.id);
+          continue;
+        }
+      } else {
+        assignment = await prisma.workerAssignment.findFirst({
+          where: { workerId: worker.id, companyId: company, status: WorkerStatus.ACTIVE },
+          select: { id: true, status: true, accessValidUntil: true },
+        });
+      }
+
+      if (!assignment) {
+        await recordDeny("Colaborador sem vínculo ativo", direction, worker.id);
         continue;
       }
 
-      if (worker.status === WorkerStatus.BLOCKED) {
+      if (assignment.status === WorkerStatus.BLOCKED) {
         await recordDeny("Colaborador bloqueado", direction, worker.id);
         continue;
       }
-      if (worker.status === WorkerStatus.INACTIVE) {
+      if (assignment.status === WorkerStatus.INACTIVE) {
         await recordDeny("Colaborador inativo", direction, worker.id);
         continue;
       }
 
-      const batchPending = await fetchPendingRequirements(company, worker.id);
+      const batchPending = await fetchPendingRequirements(company, worker.id, assignment.id);
       if (!item.override && batchPending.length > 0) {
         await recordDeny(formatPendingReason(batchPending), direction, worker.id);
         continue;
@@ -480,7 +491,7 @@ router.post(
         await recordDeny("Documentação rejeitada", direction, worker.id);
         continue;
       }
-      if (!item.override && worker.accessValidUntil && worker.accessValidUntil < occurredAt) {
+      if (!item.override && assignment.accessValidUntil && assignment.accessValidUntil < occurredAt) {
         await recordDeny("Documentação vencida", direction, worker.id);
         continue;
       }
@@ -549,19 +560,16 @@ const listSchema = z.object({
   workerName: z.string().optional(),
   result: z.nativeEnum(AccessResult).optional(),
   direction: z.nativeEnum(AccessDirection).optional(),
-  /** ISO date/datetime — filtra acessos a partir desse instante (inclusive). */
   from: z
     .string()
     .datetime({ offset: true })
     .optional()
     .transform((v) => (v ? new Date(v) : undefined)),
-  /** ISO date/datetime — filtra acessos até esse instante (inclusive). */
   to: z
     .string()
     .datetime({ offset: true })
     .optional()
     .transform((v) => (v ? new Date(v) : undefined)),
-  /** Filtro especial: "true" devolve apenas os registros operados pelo usuário autenticado. */
   mine: z.coerce.boolean().optional(),
   page: z.coerce.number().int().positive().default(1),
   pageSize: z.coerce.number().int().positive().max(100).default(50),
@@ -569,13 +577,22 @@ const listSchema = z.object({
 
 router.get(
   "/today-summary",
+  requireCapability("catraca.view", "catraca.manage"),
   asyncHandler(async (req, res) => {
     const company = companyId(req);
+    const scope = req.user!;
     const dayStart = new Date();
     dayStart.setHours(0, 0, 0, 0);
 
+    // Scope logs to the user's obra(s)
+    const obraFilter = scope.activeObraId
+      ? { worker: { assignments: { some: { obraId: scope.activeObraId } } } }
+      : scope.obraIds.length > 0
+        ? { worker: { assignments: { some: { obraId: { in: scope.obraIds } } } } }
+        : {};
+
     const logs = await prisma.accessLog.findMany({
-      where: { companyId: company, occurredAt: { gte: dayStart } },
+      where: { companyId: company, occurredAt: { gte: dayStart }, ...obraFilter },
       select: { occurredAt: true, direction: true, result: true },
       orderBy: { occurredAt: "asc" },
     });
@@ -609,16 +626,30 @@ router.get(
 
 router.get(
   "/",
+  requireCapability("catraca.view", "catraca.manage"),
   asyncHandler(async (req, res) => {
     const company = companyId(req);
+    const scope = req.user!;
     const q = listSchema.parse(req.query);
 
     const occurredAt: { gte?: Date; lte?: Date } = {};
     if (q.from) occurredAt.gte = q.from;
     if (q.to) occurredAt.lte = q.to;
 
+    // Scope to the user's obra(s) and contractor (for COLLABORATOR role)
+    const assignmentScope: Record<string, unknown> = {};
+    if (scope.activeObraId) assignmentScope.obraId = scope.activeObraId;
+    else if (scope.obraIds.length > 0) assignmentScope.obraId = { in: scope.obraIds };
+    if (scope.profile === "COLLABORATOR" && scope.contractorId) {
+      assignmentScope.contractorId = scope.contractorId;
+    }
+    const workerScopeFilter = Object.keys(assignmentScope).length > 0
+      ? { worker: { assignments: { some: assignmentScope } } }
+      : {};
+
     const where = {
       companyId: company,
+      ...workerScopeFilter,
       ...(q.workerId ? { workerId: q.workerId } : {}),
       ...(q.workerName
         ? { worker: { fullName: { contains: q.workerName, mode: "insensitive" as const } } }
@@ -637,8 +668,11 @@ router.get(
             select: {
               id: true,
               fullName: true,
-              role: true,
-              contractor: { select: { id: true, name: true } },
+              assignments: {
+                select: { role: true, contractor: { select: { id: true, name: true } } },
+                take: 1,
+                orderBy: { createdAt: "asc" },
+              },
             },
           },
         },

@@ -2,16 +2,18 @@ import type { Request, Response } from "express";
 import { workerService } from "./worker.service.js";
 import {
   addManualWorkerRequirementSchema,
+  createAssignmentSchema,
   createWorkerSchema,
   importWorkersSchema,
   listAllRequirementsQuerySchema,
   listWorkersQuerySchema,
   setWorkerRequirementApplicabilitySchema,
+  updateAssignmentSchema,
   updateWorkerSchema,
 } from "./worker.schema.js";
-import { BadRequest, Unauthorized } from "../../lib/errors.js";
+import { BadRequest } from "../../lib/errors.js";
 import { scopeFromRequest } from "../../lib/scope.js";
-import { accessTokenPayload, withAccessToken } from "./worker.present.js";
+import { accessTokenPayload, presentWorker } from "./worker.present.js";
 
 type MulterFiles = Record<string, Express.Multer.File[]> | undefined;
 
@@ -33,7 +35,7 @@ export const workerController = {
       createdById: req.user?.id,
     });
 
-    res.status(201).json(withAccessToken(worker));
+    res.status(201).json(presentWorker(worker, scope));
   },
 
   /** POST /workers/import — importação em lote (JSON com linhas da planilha). */
@@ -51,7 +53,7 @@ export const workerController = {
     const result = await workerService.list(scope, query);
     res.json({
       ...result,
-      items: result.items.map(withAccessToken),
+      items: result.items.map((worker) => presentWorker(worker, scope)),
     });
   },
 
@@ -72,22 +74,69 @@ export const workerController = {
       String(req.params.id),
       photo,
     );
-    res.json(withAccessToken(worker));
+    res.json(presentWorker(worker, scope));
   },
 
   /** GET /workers/:id */
   async getById(req: Request, res: Response) {
     const scope = scopeFromRequest(req);
     const worker = await workerService.findById(scope, String(req.params.id));
-    res.json(withAccessToken(worker));
+    res.json(presentWorker(worker, scope));
   },
 
   /** PATCH /workers/:id */
   async update(req: Request, res: Response) {
     const scope = scopeFromRequest(req);
-    const data = updateWorkerSchema.parse(req.body);
-    const worker = await workerService.update(scope, String(req.params.id), data);
-    res.json(withAccessToken(worker));
+    const workerId = String(req.params.id);
+    const personal = updateWorkerSchema.parse(req.body);
+    const assignment = updateAssignmentSchema.parse(req.body);
+
+    await workerService.update(scope, workerId, personal);
+
+    const assignmentId = await workerService.resolvePrimaryAssignmentId(
+      scope,
+      workerId,
+    );
+    const hasAssignmentUpdates = Object.values(assignment).some(
+      (v) => v !== undefined,
+    );
+    if (assignmentId && hasAssignmentUpdates) {
+      await workerService.updateAssignment(
+        scope,
+        workerId,
+        assignmentId,
+        assignment,
+      );
+    }
+
+    const worker = await workerService.findById(scope, workerId);
+    res.json(presentWorker(worker, scope));
+  },
+
+  /** POST /workers/:id/assignments — vincula colaborador a outra obra */
+  async addAssignment(req: Request, res: Response) {
+    const scope = scopeFromRequest(req);
+    const data = createAssignmentSchema.parse(req.body);
+    const assignment = await workerService.addAssignment(
+      scope,
+      String(req.params.id),
+      data,
+      req.user?.id,
+    );
+    res.status(201).json(assignment);
+  },
+
+  /** PATCH /workers/:id/assignments/:assignmentId — atualiza dados do vínculo */
+  async updateAssignment(req: Request, res: Response) {
+    const scope = scopeFromRequest(req);
+    const data = updateAssignmentSchema.parse(req.body);
+    const assignment = await workerService.updateAssignment(
+      scope,
+      String(req.params.id),
+      String(req.params.assignmentId),
+      data,
+    );
+    res.json(assignment);
   },
 
   /** GET /workers/requirements — lista todas as exigências (aba Pendentes) */
@@ -105,12 +154,14 @@ export const workerController = {
     res.json(summary);
   },
 
-  /** GET /workers/:id/requirements */
+  /** GET /workers/:id/requirements?assignmentId=... */
   async listRequirements(req: Request, res: Response) {
     const scope = scopeFromRequest(req);
+    const assignmentId = req.query.assignmentId ? String(req.query.assignmentId) : undefined;
     const items = await workerService.listRequirements(
       scope,
       String(req.params.id),
+      assignmentId,
     );
     res.json({ items });
   },
@@ -139,5 +190,25 @@ export const workerController = {
       data,
     );
     res.json(item);
+  },
+
+  /**
+   * POST /workers/:id/anonymize
+   * Direito ao apagamento (LGPD Art. 18): anonimiza dados PII do colaborador.
+   * Requer permissão colaboradores.manage e confirmação explícita no body.
+   */
+  async anonymize(req: Request, res: Response) {
+    const scope = scopeFromRequest(req);
+    if (req.body?.confirm !== true) {
+      throw BadRequest(
+        'Envie { "confirm": true } no body para confirmar a anonimização irreversível.',
+      );
+    }
+    const result = await workerService.anonymize(
+      scope,
+      String(req.params.id),
+      req.user!.id,
+    );
+    res.json(result);
   },
 };

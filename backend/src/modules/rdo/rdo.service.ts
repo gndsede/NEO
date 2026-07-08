@@ -4,7 +4,12 @@ import type { AuthScope } from "../../lib/scope.js";
 import type { CreateRdoInput, ListRdoQuery, RejectRdoInput, UpdateRdoInput } from "./rdo.schema.js";
 
 function rdoWhere(scope: AuthScope) {
-  return { companyId: scope.companyId };
+  const obraFilter = scope.activeObraId
+    ? { obraId: scope.activeObraId }
+    : scope.obraIds.length > 0
+      ? { obraId: { in: scope.obraIds } }
+      : {};
+  return { companyId: scope.companyId, ...obraFilter };
 }
 
 function toDateOrNull(v: string | undefined): Date | null {

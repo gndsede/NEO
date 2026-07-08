@@ -1,17 +1,27 @@
 import { Router } from "express";
 import multer from "multer";
 import { asyncHandler } from "../../middleware/async-handler.js";
-import { authenticate } from "../../middleware/auth.js";
-import { Unauthorized } from "../../lib/errors.js";
+import { authenticate, requireCapability } from "../../middleware/auth.js";
+import { BadRequest, Unauthorized } from "../../lib/errors.js";
 import * as crachasService from "./crachas.service.js";
+
+const TEMPLATE_MIME = new Set(["image/jpeg", "image/png", "image/webp"]);
 
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 20 * 1024 * 1024 },
+  fileFilter: (_req, file, cb) => {
+    if (!TEMPLATE_MIME.has(file.mimetype)) {
+      cb(BadRequest("Template deve ser uma imagem JPEG, PNG ou WEBP"));
+      return;
+    }
+    cb(null, true);
+  },
 });
 
 const router = Router();
 router.use(authenticate);
+router.use(requireCapability("cracha.generate"));
 
 // POST /crachas/worker/:workerId  — individual
 router.post(
@@ -27,7 +37,7 @@ router.post(
     const pdfBuf = await crachasService.gerarPorWorker(
       template.buffer,
       String(req.params.workerId),
-      req.user.companyId,
+      req.user,
     );
     res.setHeader("Content-Type", "application/pdf");
     res.setHeader("Content-Disposition", 'attachment; filename="cracha.pdf"');
@@ -58,7 +68,7 @@ router.post(
     }
     const pdfBuf = await crachasService.gerarLote(
       template.buffer,
-      req.user.companyId,
+      req.user,
       workerIds,
     );
     res.setHeader("Content-Type", "application/pdf");

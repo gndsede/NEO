@@ -4,11 +4,9 @@ import { prisma } from "../../lib/prisma.js";
 /**
  * Recalcula a validade de acesso de um colaborador a partir da documentação.
  *
- * Regra (MVP, ajustável conforme política de SST do cliente):
- * - `accessValidUntil` = menor data de validade entre documentos APROVADOS
- *   que possuem `expiresAt` (o documento que vence primeiro limita o acesso).
- * - Se houver qualquer documento REJEITADO, o colaborador fica BLOCKED.
- * - Caso contrário, ACTIVE.
+ * Documentos são compartilhados entre obras (pertencem ao Worker), então
+ * `accessValidUntil` e o bloqueio por rejeição se aplicam a todos os vínculos
+ * ativos do colaborador (WorkerAssignment).
  */
 export async function recomputeWorkerAccessValidity(
   workerId: string,
@@ -31,8 +29,11 @@ export async function recomputeWorkerAccessValidity(
       ? new Date(Math.min(...approvedExpirations.map((d) => d.getTime())))
       : null;
 
-  await prisma.worker.update({
-    where: { id: workerId },
+  // Atualiza todos os vínculos não-inativos com o novo accessValidUntil.
+  // Se há documento rejeitado, bloqueia os ativos; senão, desbloqueia os que
+  // estavam bloqueados por documentação (reativa para ACTIVE).
+  await prisma.workerAssignment.updateMany({
+    where: { workerId, status: { not: WorkerStatus.INACTIVE } },
     data: {
       accessValidUntil,
       status: hasRejected ? WorkerStatus.BLOCKED : WorkerStatus.ACTIVE,

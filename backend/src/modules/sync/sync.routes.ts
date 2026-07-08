@@ -20,7 +20,6 @@ function companyId(req: Request): string {
 }
 
 const syncQuerySchema = z.object({
-  /** ISO timestamp do último sync bem-sucedido. Se ausente, retorna todos os ativos. */
   since: z
     .string()
     .datetime({ offset: true })
@@ -34,7 +33,8 @@ const syncQuerySchema = z.object({
  * - Sem ?since: devolve TODOS os colaboradores ativos da obra (carga inicial).
  * - Com ?since: devolve só os que mudaram desde o timestamp + lista de revogados.
  *
- * O app armazena tudo em SQLite local e usa para validar acesso em modo offline.
+ * Após a migração WorkerAssignment, os dados de turno/status/empreiteira vivem
+ * no vínculo (assignment), não no Worker. Consultamos WorkerAssignment diretamente.
  */
 router.get(
   "/obra/:obraId",
@@ -47,34 +47,36 @@ router.get(
 
     const { since, limit } = syncQuerySchema.parse(req.query);
 
-    const baseWhere = {
-      companyId: company,
-      obraId,
-    };
+    const baseWhere = { companyId: company, obraId };
 
     const upsertsWhere = since
       ? { ...baseWhere, updatedAt: { gte: since } }
       : { ...baseWhere, status: { not: WorkerStatus.INACTIVE } };
 
-    const workers = await prisma.worker.findMany({
+    const assignments = await prisma.workerAssignment.findMany({
       where: upsertsWhere,
       select: {
         id: true,
-        qrHash: true,
-        fullName: true,
-        cpf: false,
         role: true,
         registration: true,
-        photoUrl: true,
         status: true,
         accessValidUntil: true,
         updatedAt: true,
         contractor: { select: { id: true, name: true } },
         function: { select: { id: true, name: true } },
-        documents: {
-          where: { status: DocumentStatus.REJEITADO },
-          select: { id: true },
-          take: 1,
+        worker: {
+          select: {
+            id: true,
+            qrHash: true,
+            fullName: true,
+            photoUrl: true,
+            updatedAt: true,
+            documents: {
+              where: { status: DocumentStatus.REJEITADO },
+              select: { id: true },
+              take: 1,
+            },
+          },
         },
       },
       orderBy: { updatedAt: "desc" },
@@ -83,26 +85,25 @@ router.get(
 
     let revokedTokens: string[] = [];
     if (since) {
-      const revoked = await prisma.worker.findMany({
+      const revoked = await prisma.workerAssignment.findMany({
         where: {
           ...baseWhere,
           updatedAt: { gte: since },
           status: WorkerStatus.INACTIVE,
         },
-        select: { qrHash: true },
+        select: { worker: { select: { qrHash: true } } },
       });
-      revokedTokens = revoked.map((w) => w.qrHash);
+      revokedTokens = revoked.map((a) => a.worker.qrHash);
     }
 
-    // Consolida quais workers do lote têm exigências documentais pendentes,
-    // para que o app possa bloquear offline com o mesmo critério do online.
-    const workerIds = workers.map((w) => w.id);
-    const pendingSet = new Set<string>();
-    if (workerIds.length > 0) {
+    // Consolida quais assignments têm exigências documentais pendentes
+    const assignmentIds = assignments.map((a) => a.id);
+    const pendingWorkerIds = new Set<string>();
+    if (assignmentIds.length > 0) {
       const pending = await prisma.workerRequirementItem.findMany({
         where: {
           companyId: company,
-          workerId: { in: workerIds },
+          assignmentId: { in: assignmentIds },
           status: {
             in: [
               RequirementCollectionStatus.NOT_SENT,
@@ -114,7 +115,7 @@ router.get(
         select: { workerId: true },
         distinct: ["workerId"],
       });
-      for (const p of pending) pendingSet.add(p.workerId);
+      for (const p of pending) pendingWorkerIds.add(p.workerId);
     }
 
     const now = new Date();
@@ -124,25 +125,21 @@ router.get(
       serverTime: now.toISOString(),
       since: since?.toISOString() ?? null,
       isInitialSync: !since,
-      total: workers.length,
-      workers: workers.map((w) => ({
-        id: w.id,
-        token: w.qrHash,
-        fullName: w.fullName,
-        role: w.role,
-        registration: w.registration,
-        photoUrl: w.photoUrl,
-        status: w.status,
-        accessValidUntil: w.accessValidUntil?.toISOString() ?? null,
-        hasRejectedDocument: w.documents.length > 0,
-        hasPendingRequirements: pendingSet.has(w.id),
-        contractor: w.contractor
-          ? { id: w.contractor.id, name: w.contractor.name }
-          : null,
-        function: w.function
-          ? { id: w.function.id, name: w.function.name }
-          : null,
-        updatedAt: w.updatedAt.toISOString(),
+      total: assignments.length,
+      workers: assignments.map((a) => ({
+        id: a.worker.id,
+        token: a.worker.qrHash,
+        fullName: a.worker.fullName,
+        role: a.role,
+        registration: a.registration,
+        photoUrl: a.worker.photoUrl,
+        status: a.status,
+        accessValidUntil: a.accessValidUntil?.toISOString() ?? null,
+        hasRejectedDocument: a.worker.documents.length > 0,
+        hasPendingRequirements: pendingWorkerIds.has(a.worker.id),
+        contractor: a.contractor ? { id: a.contractor.id, name: a.contractor.name } : null,
+        function: a.function ? { id: a.function.id, name: a.function.name } : null,
+        updatedAt: a.updatedAt.toISOString(),
       })),
       revokedTokens,
     });

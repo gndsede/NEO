@@ -5,7 +5,7 @@ import { asyncHandler } from "../../middleware/async-handler.js";
 import { authenticate, requireCapability } from "../../middleware/auth.js";
 import { BadRequest, NotFound, Unauthorized } from "../../lib/errors.js";
 import { hasCapability, normalizePermissions } from "../../lib/permissions.js";
-import { obraWhere, scopeFromRequest } from "../../lib/scope.js";
+import { scopeFromRequest } from "../../lib/scope.js";
 import { obraUpsertSchema } from "./obras.schema.js";
 
 const router = Router();
@@ -16,24 +16,39 @@ function companyId(req: Request): string {
   return req.user.companyId;
 }
 
+// A Obra conta colaboradores via workerAssignments. Renomeia para `workers`
+// na resposta, mantendo o contrato esperado pelo frontend.
+const OBRA_COUNT_SELECT = {
+  contractors: true,
+  workerAssignments: true,
+  userAccess: true,
+} as const;
+
+type ObraWithCount<T> = T & {
+  _count: { contractors: number; workerAssignments: number; userAccess: number };
+};
+
+function mapObraCount<T>(obra: ObraWithCount<T>) {
+  const { workerAssignments, ...rest } = obra._count;
+  return { ...obra, _count: { ...rest, workers: workerAssignments } };
+}
+
 router.get(
   "/",
   asyncHandler(async (req, res) => {
     const scope = scopeFromRequest(req);
+    // O modelo Obra é filtrado pelo próprio id (não por obraId). Lista todas as
+    // obras que o usuário pode acessar — usado pelo seletor de obra.
     const items = await prisma.obra.findMany({
       where: {
         companyId: scope.companyId,
         active: true,
-        ...obraWhere(scope),
+        id: { in: scope.obraIds },
       },
       orderBy: { name: "asc" },
-      include: {
-        _count: {
-          select: { contractors: true, workers: true, userAccess: true },
-        },
-      },
+      include: { _count: { select: OBRA_COUNT_SELECT } },
     });
-    res.json({ items, activeObraId: scope.activeObraId });
+    res.json({ items: items.map(mapObraCount), activeObraId: scope.activeObraId });
   }),
 );
 
@@ -44,13 +59,9 @@ router.get(
     const items = await prisma.obra.findMany({
       where: { companyId: companyId(req) },
       orderBy: { name: "asc" },
-      include: {
-        _count: {
-          select: { contractors: true, workers: true, userAccess: true },
-        },
-      },
+      include: { _count: { select: OBRA_COUNT_SELECT } },
     });
-    res.json({ items });
+    res.json({ items: items.map(mapObraCount) });
   }),
 );
 
@@ -58,20 +69,18 @@ router.get(
   "/:id",
   asyncHandler(async (req, res) => {
     const scope = scopeFromRequest(req);
+    const obraId = String(req.params.id);
+    // Só permite acessar obra dentro do escopo do usuário.
+    if (!scope.obraIds.includes(obraId)) throw NotFound("Obra não encontrada");
     const item = await prisma.obra.findFirst({
       where: {
-        id: String(req.params.id),
+        id: obraId,
         companyId: scope.companyId,
-        ...obraWhere(scope),
       },
-      include: {
-        _count: {
-          select: { contractors: true, workers: true, userAccess: true },
-        },
-      },
+      include: { _count: { select: OBRA_COUNT_SELECT } },
     });
     if (!item) throw NotFound("Obra não encontrada");
-    res.json(item);
+    res.json(mapObraCount(item));
   }),
 );
 

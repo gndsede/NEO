@@ -6,6 +6,11 @@ import {
 } from "@prisma/client";
 import { prisma } from "../../lib/prisma.js";
 import { getStorage } from "../../lib/storage/index.js";
+import {
+  contractorScopeWhere,
+  workerScopeWhere,
+  type AuthScope,
+} from "../../lib/scope.js";
 import { BadRequest, Forbidden, NotFound } from "../../lib/errors.js";
 import { recomputeWorkerAccessValidity } from "../workers/worker.access.js";
 import {
@@ -43,18 +48,23 @@ async function notifyRejection(doc: {
       where: { id: doc.workerId },
       select: {
         fullName: true,
-        contractor: { select: { name: true, email: true } },
+        assignments: {
+          select: { contractor: { select: { name: true, email: true } } },
+          orderBy: { createdAt: "desc" as const },
+          take: 1,
+        },
       },
     });
-    if (!worker?.contractor.email) return;
+    const contractor = worker?.assignments[0]?.contractor;
+    if (!contractor?.email) return;
     payload = {
       companyId: doc.companyId,
       documentId: doc.id,
-      workerName: worker.fullName,
+      workerName: worker!.fullName,
       documentName,
       rejectionReason: reason,
-      contractorName: worker.contractor.name,
-      contractorEmail: worker.contractor.email,
+      contractorName: contractor.name,
+      contractorEmail: contractor.email,
     };
   } else if (doc.ownerType === DocumentOwnerType.CONTRACTOR && doc.contractorId) {
     const contractor = await prisma.contractor.findUnique({
@@ -98,9 +108,16 @@ export class DocumentService {
     return doc;
   }
 
-  async list(companyId: string, query: ListDocumentsQuery) {
+  async list(scope: AuthScope, query: ListDocumentsQuery) {
     const where: Prisma.DocumentWhereInput = {
-      companyId,
+      companyId: scope.companyId,
+      // Escopo por obra: documento pertence a um worker/contractor dentro
+      // das obras do usuário (ou é documento avulso da empresa).
+      OR: [
+        { worker: workerScopeWhere(scope) },
+        { contractor: contractorScopeWhere(scope) },
+        { AND: [{ workerId: null }, { contractorId: null }] },
+      ],
       ...(query.ownerType ? { ownerType: query.ownerType } : {}),
       ...(query.workerId ? { workerId: query.workerId } : {}),
       ...(query.contractorId ? { contractorId: query.contractorId } : {}),
@@ -135,9 +152,17 @@ export class DocumentService {
     };
   }
 
-  async getById(companyId: string, id: string) {
+  async getById(scope: AuthScope, id: string) {
     const doc = await prisma.document.findFirst({
-      where: { id, companyId },
+      where: {
+        id,
+        companyId: scope.companyId,
+        OR: [
+          { worker: workerScopeWhere(scope) },
+          { contractor: contractorScopeWhere(scope) },
+          { AND: [{ workerId: null }, { contractorId: null }] },
+        ],
+      },
       include: {
         reviewedBy: { select: { id: true, name: true, email: true } },
         uploadedBy: { select: { id: true, name: true, email: true } },

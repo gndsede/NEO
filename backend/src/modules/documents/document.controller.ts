@@ -18,17 +18,14 @@ export const documentController = {
   async list(req: Request, res: Response) {
     if (!req.user) throw Unauthorized();
     const query = listDocumentsQuerySchema.parse(req.query);
-    const result = await documentService.list(req.user.companyId, query);
+    const result = await documentService.list(req.user, query);
     res.json(result);
   },
 
   /** GET /documents/:id */
   async getById(req: Request, res: Response) {
     if (!req.user) throw Unauthorized();
-    const doc = await documentService.getById(
-      req.user.companyId,
-      String(req.params.id),
-    );
+    const doc = await documentService.getById(req.user, String(req.params.id));
     res.json(doc);
   },
 
