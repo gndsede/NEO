@@ -8,6 +8,8 @@ RUN npm ci
 FROM deps AS build
 COPY prisma ./prisma
 COPY prisma.config.ts ./
+# prisma generate só precisa resolver prisma.config.ts; não conecta ao banco.
+ENV DATABASE_URL="postgresql://build:build@localhost:5432/build"
 RUN npm run prisma:generate
 COPY tsconfig.json ./
 COPY src ./src
