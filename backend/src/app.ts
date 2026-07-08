@@ -55,6 +55,11 @@ export function createApp() {
   app.use(express.urlencoded({ extended: true }));
   app.use(morgan(env.NODE_ENV === "development" ? "dev" : "combined"));
 
+  // Healthcheck para plataformas de deploy (Railway, etc.)
+  app.get("/health", (_req, res) => {
+    res.json({ status: "ok", service: "accesshub-api", ts: new Date().toISOString() });
+  });
+
   // Storage local: arquivos exigem URL assinada (sig + exp) gerada pela API.
   // Sem assinatura válida, fotos e documentos não são servidos.
   if (env.STORAGE_DRIVER === "local") {

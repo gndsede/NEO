@@ -1,5 +1,7 @@
-FROM node:22-alpine AS base
+FROM node:22-bookworm-slim AS base
 WORKDIR /app
+RUN apt-get update && apt-get install -y --no-install-recommends openssl ca-certificates \
+  && rm -rf /var/lib/apt/lists/*
 
 FROM base AS deps
 COPY backend/package.json backend/package-lock.json ./
@@ -19,12 +21,12 @@ FROM base AS runner
 ENV NODE_ENV=production
 WORKDIR /app
 COPY backend/package.json backend/package-lock.json ./
-RUN npm ci --omit=dev
+RUN npm ci --omit=dev && npm install prisma --no-save
 COPY --from=build /app/dist ./dist
 COPY --from=build /app/node_modules/.prisma ./node_modules/.prisma
-COPY --from=build /app/node_modules/@prisma ./node_modules/@prisma
 COPY backend/prisma ./prisma
 COPY backend/prisma.config.ts ./
-RUN npm install prisma --no-save
+COPY backend/scripts/docker-entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
 EXPOSE 3333
-CMD ["sh", "-c", "npx prisma migrate deploy && node dist/server.js"]
+CMD ["/entrypoint.sh"]
