@@ -387,7 +387,17 @@ router.get(
 
     // Pega o email do primeiro usuário de cada tenant como contato
     const tenantIds = items.map((c) => c.id);
-  
+
+    const firstUsers =
+      tenantIds.length > 0
+        ? await prisma.user.findMany({
+            where: { companyId: { in: tenantIds } },
+            distinct: ["companyId"],
+            orderBy: { createdAt: "asc" },
+            select: { companyId: true, email: true },
+          })
+        : [];
+
     const userByCompany = Object.fromEntries(firstUsers.map((u) => [u.companyId, u]));
 
     const mapped = items.map((c) => ({
