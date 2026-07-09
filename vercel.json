@@ -1,0 +1,7 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "framework": "tanstack-start",
+  "installCommand": "git submodule update --init --recursive ingress-craftsman && npm install --prefix ingress-craftsman",
+  "buildCommand": "npm run build --prefix ingress-craftsman",
+  "outputDirectory": "ingress-craftsman/.vercel/output"
+}

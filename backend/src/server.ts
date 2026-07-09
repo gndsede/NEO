@@ -51,3 +51,4 @@ bootstrap().catch((err) => {
   console.error("Falha no boot da aplicação:", err);
   process.exit(1);
 });
+
