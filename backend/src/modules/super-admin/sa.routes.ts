@@ -111,8 +111,9 @@ const tenantCreateSchema = z.object({
 const tenantUpdateSchema = z.object({
   name: z.string().min(1).optional(),
   legalName: z.string().optional(),
+  cnpj: z.string().optional(),
   plan: z.enum(["STARTER", "PROFISSIONAL", "ENTERPRISE"]).optional(),
-  workerLimit: z.number().int().positive().optional(),
+  workerLimit: z.number().int().positive().optional().nullable(),
   licenseExpiresAt: z.string().datetime().optional().nullable(),
 });
 
@@ -582,6 +583,7 @@ router.patch(
       data: {
         ...(data.name !== undefined && { name: data.name }),
         ...(data.legalName !== undefined && { legalName: data.legalName }),
+        ...(data.cnpj !== undefined && { document: data.cnpj }),
         ...(data.plan !== undefined && { plan: data.plan }),
         ...(data.workerLimit !== undefined && { workerLimit: data.workerLimit }),
         ...(data.licenseExpiresAt !== undefined && {
