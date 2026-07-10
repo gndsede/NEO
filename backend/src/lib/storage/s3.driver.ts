@@ -1,5 +1,4 @@
 import { randomUUID } from "node:crypto";
-import { extname } from "node:path";
 import {
   DeleteObjectCommand,
   GetObjectCommand,
@@ -8,6 +7,7 @@ import {
 } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { env } from "../../config/env.js";
+import { safeExtFromMime } from "./mime-ext.js";
 import type { StorageDriver, StoredFile, UploadInput } from "./types.js";
 
 /**
@@ -55,7 +55,7 @@ export class S3StorageDriver implements StorageDriver {
   }
 
   async upload(input: UploadInput): Promise<StoredFile> {
-    const ext = extname(input.originalName) || "";
+    const ext = safeExtFromMime(input.mimeType);
     const key = `${input.folder.replace(/\/$/, "")}/${randomUUID()}${ext}`;
 
     await this.client.send(

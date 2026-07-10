@@ -1,8 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { mkdir, writeFile, rm } from "node:fs/promises";
 import path from "node:path";
-import { extname } from "node:path";
 import { env } from "../../config/env.js";
+import { safeExtFromMime } from "./mime-ext.js";
 import type { StorageDriver, StoredFile, UploadInput } from "./types.js";
 
 /**
@@ -15,7 +15,7 @@ export class LocalStorageDriver implements StorageDriver {
   private readonly publicUrl = env.LOCAL_STORAGE_PUBLIC_URL.replace(/\/$/, "");
 
   async upload(input: UploadInput): Promise<StoredFile> {
-    const ext = extname(input.originalName) || "";
+    const ext = safeExtFromMime(input.mimeType);
     const key = `${input.folder.replace(/\/$/, "")}/${randomUUID()}${ext}`;
     const fullPath = path.join(this.baseDir, key);
 

@@ -203,6 +203,10 @@ model User {
   /// Segredo TOTP (base32) para autenticação de dois fatores via Google Authenticator.
   totpSecret   String?
   totpEnabled  Boolean  @default(false)
+  /// Token de convite (definir senha do primeiro acesso). Único e de uso único;
+  /// limpo assim que a senha é definida. Usuário fica com active=false até lá.
+  inviteToken          String?   @unique
+  inviteTokenExpiresAt DateTime?
   createdAt    DateTime @default(now())
   updatedAt    DateTime @updatedAt
 

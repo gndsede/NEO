@@ -12,18 +12,24 @@ const envSchema = z.object({
   PORT: z.coerce.number().int().positive().default(3333),
   CORS_ORIGIN: z.string().default("*"),
 
+  // URL pública do frontend (Vercel) — usada para montar links de e-mail
+  // (ex.: convite de definição de senha do administrador do tenant).
+  FRONTEND_URL: z.string().url().default("http://localhost:5173"),
+
   // Número de proxies confiáveis à frente da API (nginx/ELB = 1).
   // Necessário para o rate limit identificar o IP real do cliente.
   TRUST_PROXY: z.coerce.number().int().min(0).default(0),
 
   DATABASE_URL: z.string().url(),
 
-  JWT_SECRET: z.string().min(8, "JWT_SECRET deve ter ao menos 8 caracteres"),
+  JWT_SECRET: z
+    .string()
+    .min(32, "JWT_SECRET deve ter ao menos 32 caracteres (ex.: openssl rand -hex 32)"),
   JWT_EXPIRES_IN: z.string().default("7d"),
 
   BADGE_HASH_SECRET: z
     .string()
-    .min(8, "BADGE_HASH_SECRET deve ter ao menos 8 caracteres"),
+    .min(32, "BADGE_HASH_SECRET deve ter ao menos 32 caracteres (ex.: openssl rand -hex 32)"),
   BADGE_VERIFY_BASE_URL: z.string().optional(),
 
   STORAGE_DRIVER: z.enum(["local", "s3", "supabase"]).default("local"),

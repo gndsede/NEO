@@ -2,6 +2,7 @@ import { Resend } from "resend";
 import { type NotificationType } from "@prisma/client";
 import { env } from "../../config/env.js";
 import { prisma } from "../../lib/prisma.js";
+import { escapeHtml } from "../../lib/html-escape.js";
 
 let _resend: Resend | null = null;
 
@@ -188,15 +189,15 @@ function baseLayout(content: string): string {
 function rejectionTemplate(ctx: RejectionNoticeInput): string {
   return baseLayout(`
     <h2 style="color:#b91c1c;margin:0 0 16px;">Documento reprovado</h2>
-    <p style="color:#374151;margin:0 0 8px;">Olá, <strong>${ctx.contractorName}</strong>.</p>
+    <p style="color:#374151;margin:0 0 8px;">Olá, <strong>${escapeHtml(ctx.contractorName)}</strong>.</p>
     <p style="color:#374151;margin:0 0 24px;">
-      O documento <strong>${ctx.documentName}</strong> do colaborador
-      <strong>${ctx.workerName}</strong> foi <strong style="color:#b91c1c;">reprovado</strong>.
+      O documento <strong>${escapeHtml(ctx.documentName)}</strong> do colaborador
+      <strong>${escapeHtml(ctx.workerName)}</strong> foi <strong style="color:#b91c1c;">reprovado</strong>.
     </p>
     <table width="100%" cellpadding="12" cellspacing="0" style="background:#fef2f2;border-radius:6px;margin-bottom:24px;">
       <tr>
         <td style="color:#374151;font-size:14px;">
-          <strong>Motivo:</strong> ${ctx.rejectionReason}
+          <strong>Motivo:</strong> ${escapeHtml(ctx.rejectionReason)}
         </td>
       </tr>
     </table>
@@ -218,8 +219,8 @@ function expiryTemplate(ctx: ExpiryDigestInput): string {
     .map(
       (item) => `
       <tr style="border-bottom:1px solid #e5e7eb;">
-        <td style="padding:10px 12px;color:#374151;font-size:14px;">${item.workerOrContractorName}</td>
-        <td style="padding:10px 12px;color:#374151;font-size:14px;">${item.documentName}</td>
+        <td style="padding:10px 12px;color:#374151;font-size:14px;">${escapeHtml(item.workerOrContractorName)}</td>
+        <td style="padding:10px 12px;color:#374151;font-size:14px;">${escapeHtml(item.documentName)}</td>
         <td style="padding:10px 12px;text-align:right;">
           <span style="background:${badgeColor};color:${badgeTextColor};font-size:12px;font-weight:bold;padding:2px 8px;border-radius:4px;">
             ${badgeText} — ${formatDate(item.expiresAt)}
@@ -229,9 +230,10 @@ function expiryTemplate(ctx: ExpiryDigestInput): string {
     )
     .join("");
 
+  const contractorNameSafe = escapeHtml(ctx.contractorName);
   const intro = isExpired
-    ? `Os documentos abaixo da empreiteira <strong>${ctx.contractorName}</strong> estão <strong style="color:${titleColor};">vencidos</strong>. O acesso dos colaboradores pode estar bloqueado.`
-    : `Os documentos abaixo da empreiteira <strong>${ctx.contractorName}</strong> vencem nos <strong style="color:${titleColor};">próximos 7 dias</strong>. Providencie a renovação para evitar bloqueio de acesso.`;
+    ? `Os documentos abaixo da empreiteira <strong>${contractorNameSafe}</strong> estão <strong style="color:${titleColor};">vencidos</strong>. O acesso dos colaboradores pode estar bloqueado.`
+    : `Os documentos abaixo da empreiteira <strong>${contractorNameSafe}</strong> vencem nos <strong style="color:${titleColor};">próximos 7 dias</strong>. Providencie a renovação para evitar bloqueio de acesso.`;
 
   return baseLayout(`
     <h2 style="color:${titleColor};margin:0 0 16px;">

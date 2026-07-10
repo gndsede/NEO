@@ -8,10 +8,11 @@ import { prisma } from "../../lib/prisma.js";
 import { asyncHandler } from "../../middleware/async-handler.js";
 import { authenticate, signUserToken } from "../../middleware/auth.js";
 import { loginRateLimit } from "../../middleware/rate-limit.js";
-import { BadRequest, Forbidden, Unauthorized } from "../../lib/errors.js";
+import { BadRequest, Forbidden, NotFound, Unauthorized } from "../../lib/errors.js";
 import { hasAnyCapability, hasCapability, normalizePermissions } from "../../lib/permissions.js";
 import { loadObraIdsForUser } from "../../lib/scope.js";
 import { env } from "../../config/env.js";
+import { publicRateLimit } from "../../middleware/rate-limit.js";
 
 const router = Router();
 
@@ -38,7 +39,9 @@ interface PreAuthClaims {
 
 function verifyPreAuthToken(token: string): PreAuthClaims {
   try {
-    const decoded = jwt.verify(token, env.JWT_SECRET) as PreAuthClaims;
+    const decoded = jwt.verify(token, env.JWT_SECRET, {
+      algorithms: ["HS256"],
+    }) as PreAuthClaims;
     if (decoded.aud !== "pre-auth") throw new Error("audience inválido");
     return decoded;
   } catch {
@@ -497,6 +500,66 @@ router.post(
         obras,
       },
     });
+  }),
+);
+
+// ---------------------------------------------------------------------------
+// Convite de primeiro acesso (tenant criado pelo super-admin)
+// ---------------------------------------------------------------------------
+
+async function findValidInvite(token: string) {
+  const user = await prisma.user.findUnique({
+    where: { inviteToken: token },
+    select: {
+      id: true,
+      email: true,
+      inviteTokenExpiresAt: true,
+      company: { select: { name: true } },
+    },
+  });
+  if (!user || !user.inviteTokenExpiresAt || user.inviteTokenExpiresAt < new Date()) {
+    return null;
+  }
+  return user;
+}
+
+// GET /auth/invite/:token — valida o convite e devolve dados para a tela de definir senha
+router.get(
+  "/invite/:token",
+  publicRateLimit,
+  asyncHandler(async (req, res) => {
+    const invite = await findValidInvite(String(req.params.token));
+    if (!invite) throw NotFound("Convite inválido ou expirado.");
+    res.json({ email: invite.email, companyName: invite.company.name });
+  }),
+);
+
+const acceptInviteSchema = z.object({
+  password: z.string().min(8, "A senha deve ter ao menos 8 caracteres"),
+});
+
+// POST /auth/invite/:token — define a senha e ativa a conta
+router.post(
+  "/invite/:token",
+  publicRateLimit,
+  asyncHandler(async (req, res) => {
+    const invite = await findValidInvite(String(req.params.token));
+    if (!invite) throw NotFound("Convite inválido ou expirado.");
+
+    const { password } = acceptInviteSchema.parse(req.body);
+    const passwordHash = await bcrypt.hash(password, 10);
+
+    await prisma.user.update({
+      where: { id: invite.id },
+      data: {
+        passwordHash,
+        active: true,
+        inviteToken: null,
+        inviteTokenExpiresAt: null,
+      },
+    });
+
+    res.json({ success: true });
   }),
 );
 

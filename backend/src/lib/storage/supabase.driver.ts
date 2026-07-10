@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
-import { extname } from "node:path";
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 import { env } from "../../config/env.js";
+import { safeExtFromMime } from "./mime-ext.js";
 import type { StorageDriver, StoredFile, UploadInput } from "./types.js";
 
 /**
@@ -31,7 +31,7 @@ export class SupabaseStorageDriver implements StorageDriver {
   }
 
   async upload(input: UploadInput): Promise<StoredFile> {
-    const ext = extname(input.originalName) || "";
+    const ext = safeExtFromMime(input.mimeType);
     const key = `${input.folder.replace(/\/$/, "")}/${randomUUID()}${ext}`;
 
     const { error } = await this.client.storage

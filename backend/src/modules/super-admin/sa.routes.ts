@@ -1,3 +1,4 @@
+import { randomBytes } from "node:crypto";
 import type { NextFunction, Request, Response } from "express";
 import { Router } from "express";
 import { z } from "zod";
@@ -10,6 +11,10 @@ import { asyncHandler } from "../../middleware/async-handler.js";
 import { loginRateLimit } from "../../middleware/rate-limit.js";
 import { BadRequest, Unauthorized, NotFound } from "../../lib/errors.js";
 import { env } from "../../config/env.js";
+import { fullPermissions } from "../../lib/permissions.js";
+import { sendTenantInviteEmail } from "../../lib/invite-email.js";
+
+const INVITE_TOKEN_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 dias
 
 declare global {
   // eslint-disable-next-line @typescript-eslint/no-namespace
@@ -42,7 +47,9 @@ interface SaClaims { sub: string; aud: string }
 
 function verifySaToken(token: string): SaClaims {
   try {
-    const decoded = jwt.verify(token, env.JWT_SECRET) as SaClaims;
+    const decoded = jwt.verify(token, env.JWT_SECRET, {
+      algorithms: ["HS256"],
+    }) as SaClaims;
     if (decoded.aud !== "super-admin") throw new Error("audience inválido");
     return decoded;
   } catch {
@@ -52,7 +59,9 @@ function verifySaToken(token: string): SaClaims {
 
 function verifySaPreAuth(token: string): SaClaims {
   try {
-    const decoded = jwt.verify(token, env.JWT_SECRET) as SaClaims;
+    const decoded = jwt.verify(token, env.JWT_SECRET, {
+      algorithms: ["HS256"],
+    }) as SaClaims;
     if (decoded.aud !== "sa-pre-auth") throw new Error("audience inválido");
     return decoded;
   } catch {
@@ -86,10 +95,17 @@ const verifyTotpSchema = z.object({
 const tenantCreateSchema = z.object({
   name: z.string().min(1),
   legalName: z.string().optional(),
-  document: z.string().optional(),
+  // O frontend chama esse campo de "cnpj" (nome que o usuário reconhece);
+  // no banco ele é a coluna "document" (Company.document).
+  cnpj: z.string().optional(),
   plan: z.enum(["STARTER", "PROFISSIONAL", "ENTERPRISE"]).optional(),
-  workerLimit: z.number().int().positive().optional(),
+  workerLimit: z.number().int().positive().nullable().optional(),
   licenseExpiresAt: z.string().datetime().optional(),
+  // Alternativa mais amigável ao licenseExpiresAt: duração em meses a partir de hoje.
+  licenseMonths: z.number().int().positive().optional(),
+  // Primeiro administrador do tenant — recebe um e-mail de convite para definir a senha.
+  adminName: z.string().min(1),
+  email: z.string().email(),
 });
 
 const tenantUpdateSchema = z.object({
@@ -402,6 +418,10 @@ router.get(
 
     const mapped = items.map((c) => ({
       ...c,
+      // Alias esperado pelo frontend (rótulo "CNPJ"); nunca undefined, para
+      // não quebrar `.includes()` na busca do painel quando o tenant não tiver document.
+      cnpj: c.document ?? "",
+      status: c.blocked ? "BLOCKED" : c.active ? "ACTIVE" : "PENDING",
       email: userByCompany[c.id]?.email ?? null,
       userCount: c._count.users,
       workerCount: c._count.workers,
@@ -417,18 +437,67 @@ router.post(
   asyncHandler(async (req, res) => {
     const data = tenantCreateSchema.parse(req.body);
 
-    const company = await prisma.company.create({
-      data: {
-        name: data.name,
-        legalName: data.legalName,
-        document: data.document,
-        plan: data.plan ?? "STARTER",
-        workerLimit: data.workerLimit,
-        licenseExpiresAt: data.licenseExpiresAt ? new Date(data.licenseExpiresAt) : undefined,
-      },
+    // licenseMonths tem prioridade sobre licenseExpiresAt quando ambos vierem
+    // (é o que o formulário do painel envia).
+    let licenseExpiresAt: Date | undefined;
+    if (data.licenseMonths) {
+      licenseExpiresAt = new Date();
+      licenseExpiresAt.setMonth(licenseExpiresAt.getMonth() + data.licenseMonths);
+    } else if (data.licenseExpiresAt) {
+      licenseExpiresAt = new Date(data.licenseExpiresAt);
+    }
+
+    const normalizedEmail = data.email.trim().toLowerCase();
+    const existingUser = await prisma.user.findUnique({
+      where: { email: normalizedEmail },
+      select: { id: true },
+    });
+    if (existingUser) {
+      throw BadRequest("Já existe um usuário cadastrado com este e-mail.");
+    }
+
+    const inviteToken = randomBytes(32).toString("hex");
+    const inviteTokenExpiresAt = new Date(Date.now() + INVITE_TOKEN_TTL_MS);
+    // Placeholder inutilizável — passwordHash é NOT NULL, mas o login fica
+    // bloqueado por `active: false` até o convite ser aceito.
+    const placeholderPasswordHash = await bcrypt.hash(randomBytes(32).toString("hex"), 10);
+
+    const { company, user } = await prisma.$transaction(async (tx) => {
+      const company = await tx.company.create({
+        data: {
+          name: data.name,
+          legalName: data.legalName,
+          document: data.cnpj,
+          plan: data.plan ?? "STARTER",
+          workerLimit: data.workerLimit ?? undefined,
+          licenseExpiresAt,
+        },
+      });
+
+      const user = await tx.user.create({
+        data: {
+          companyId: company.id,
+          name: data.adminName,
+          email: normalizedEmail,
+          passwordHash: placeholderPasswordHash,
+          profile: "USER",
+          permissions: fullPermissions(),
+          active: false,
+          inviteToken,
+          inviteTokenExpiresAt,
+        },
+      });
+
+      return { company, user };
     });
 
-    res.status(201).json(company);
+    const inviteSent = await sendTenantInviteEmail({
+      recipientEmail: user.email,
+      companyName: company.name,
+      inviteToken,
+    });
+
+    res.status(201).json({ company, inviteSent });
   }),
 );
 

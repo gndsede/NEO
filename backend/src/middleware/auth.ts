@@ -124,7 +124,9 @@ export function authenticate(
         throw Unauthorized("Token de acesso ausente");
       }
       const token = header.slice("Bearer ".length).trim();
-      const decoded = jwt.verify(token, env.JWT_SECRET) as AccessTokenClaims;
+      const decoded = jwt.verify(token, env.JWT_SECRET, {
+        algorithms: ["HS256"],
+      }) as AccessTokenClaims;
       // Rejeita tokens de outros fluxos (pré-2FA, super-admin) usados como sessão.
       if (decoded.aud !== ACCESS_TOKEN_AUDIENCE) {
         throw Unauthorized("Token inválido para esta operação");
