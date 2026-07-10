@@ -499,7 +499,12 @@ router.post(
       inviteToken,
     });
 
-    res.status(201).json({ company, inviteSent });
+    // Sempre devolvemos o link — o e-mail é só uma conveniência; se falhar
+    // (chave do Resend ausente, domínio não verificado etc.), o super-admin
+    // ainda consegue copiar e enviar manualmente.
+    const inviteUrl = `${env.FRONTEND_URL.replace(/\/$/, "")}/aceitar-convite?token=${encodeURIComponent(inviteToken)}`;
+
+    res.status(201).json({ company, inviteSent, inviteUrl });
   }),
 );
 
