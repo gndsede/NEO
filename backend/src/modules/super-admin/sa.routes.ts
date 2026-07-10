@@ -508,6 +508,55 @@ router.post(
   }),
 );
 
+const resendInviteSchema = z.object({
+  // Permite reenviar para outro endereço (ex.: testar com o próprio e-mail
+  // do super-admin, já que o Resend em modo sandbox só entrega pra ele).
+  email: z.string().email().optional(),
+});
+
+// POST /super-admin/tenants/:id/resend-invite
+router.post(
+  "/tenants/:id/resend-invite",
+  asyncHandler(async (req, res) => {
+    const { email } = resendInviteSchema.parse(req.body);
+    const companyId = String(req.params.id);
+
+    const company = await prisma.company.findUnique({
+      where: { id: companyId },
+      select: { name: true },
+    });
+    if (!company) throw NotFound("Tenant não encontrado");
+
+    const pendingUser = await prisma.user.findFirst({
+      where: { companyId, inviteToken: { not: null } },
+      orderBy: { createdAt: "asc" },
+    });
+    if (!pendingUser) {
+      throw BadRequest(
+        "Não há convite pendente para este tenant (o administrador já definiu a senha, ou o tenant não tem usuário).",
+      );
+    }
+
+    const inviteToken = randomBytes(32).toString("hex");
+    const inviteTokenExpiresAt = new Date(Date.now() + INVITE_TOKEN_TTL_MS);
+    await prisma.user.update({
+      where: { id: pendingUser.id },
+      data: { inviteToken, inviteTokenExpiresAt },
+    });
+
+    const recipientEmail = email ?? pendingUser.email;
+    const inviteSent = await sendTenantInviteEmail({
+      recipientEmail,
+      companyName: company.name,
+      inviteToken,
+    });
+
+    const inviteUrl = `${env.FRONTEND_URL.replace(/\/$/, "")}/aceitar-convite?token=${encodeURIComponent(inviteToken)}`;
+
+    res.json({ inviteSent, inviteUrl, recipientEmail });
+  }),
+);
+
 // GET /super-admin/tenants/:id
 router.get(
   "/tenants/:id",
