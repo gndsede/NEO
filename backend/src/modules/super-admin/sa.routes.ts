@@ -471,6 +471,8 @@ router.post(
           plan: data.plan ?? "STARTER",
           workerLimit: data.workerLimit ?? undefined,
           licenseExpiresAt,
+          // Token usado por integrações de API do tenant (ex.: catraca).
+          accessToken: randomBytes(24).toString("hex"),
         },
       });
 
