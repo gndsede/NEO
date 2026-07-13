@@ -25,6 +25,7 @@ COPY --from=build /app/dist ./dist
 COPY --from=build /app/node_modules/.prisma ./node_modules/.prisma
 COPY prisma ./prisma
 COPY prisma.config.ts ./
+COPY assets ./assets
 COPY scripts/docker-entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 EXPOSE 3333
