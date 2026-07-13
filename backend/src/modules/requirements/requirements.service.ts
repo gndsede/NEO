@@ -53,21 +53,22 @@ export class RequirementsService {
     functionId: string,
     requirementIds: string[],
   ) {
-    const workers = await tx.worker.findMany({
+    // `functionId` vive em WorkerAssignment (vínculo por obra), não em Worker.
+    const assignments = await tx.workerAssignment.findMany({
       where: { companyId, functionId },
-      select: { id: true },
+      select: { id: true, workerId: true },
     });
-    if (!workers.length || !requirementIds.length) return;
+    if (!assignments.length || !requirementIds.length) return;
 
     const defs = await tx.documentRequirementDefinition.findMany({
       where: { id: { in: requirementIds }, companyId, target: RequirementTarget.WORKER },
     });
 
-    for (const worker of workers) {
+    for (const assignment of assignments) {
       const existing = await tx.workerRequirementItem.findMany({
         where: {
           companyId,
-          workerId: worker.id,
+          assignmentId: assignment.id,
           source: RequirementSource.FUNCTION_TEMPLATE,
           requirementId: { in: requirementIds },
         },
@@ -80,7 +81,8 @@ export class RequirementsService {
         await tx.workerRequirementItem.create({
           data: {
             companyId,
-            workerId: worker.id,
+            workerId: assignment.workerId,
+            assignmentId: assignment.id,
             requirementId: def.id,
             source: RequirementSource.FUNCTION_TEMPLATE,
             status: RequirementCollectionStatus.NOT_SENT,
