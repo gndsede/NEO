@@ -13,6 +13,7 @@ import { BadRequest, Unauthorized, NotFound } from "../../lib/errors.js";
 import { env } from "../../config/env.js";
 import { fullPermissions } from "../../lib/permissions.js";
 import { sendTenantInviteEmail } from "../../lib/invite-email.js";
+import { hashPassword } from "../../lib/password.js";
 
 const INVITE_TOKEN_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 dias
 
@@ -461,7 +462,7 @@ router.post(
     const inviteTokenExpiresAt = new Date(Date.now() + INVITE_TOKEN_TTL_MS);
     // Placeholder inutilizável — passwordHash é NOT NULL, mas o login fica
     // bloqueado por `active: false` até o convite ser aceito.
-    const placeholderPasswordHash = await bcrypt.hash(randomBytes(32).toString("hex"), 10);
+    const placeholderPasswordHash = await hashPassword(randomBytes(32).toString("hex"));
 
     const { company, user } = await prisma.$transaction(async (tx) => {
       const company = await tx.company.create({

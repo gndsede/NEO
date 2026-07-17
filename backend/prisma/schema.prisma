@@ -203,10 +203,17 @@ model User {
   /// Segredo TOTP (base32) para autenticação de dois fatores via Google Authenticator.
   totpSecret   String?
   totpEnabled  Boolean  @default(false)
+  /// Códigos de backup do 2FA (hashes bcrypt, uso único). Gerados na ativação;
+  /// cada uso remove o hash consumido. Null = nunca gerados.
+  totpBackupCodes Json?
   /// Token de convite (definir senha do primeiro acesso). Único e de uso único;
   /// limpo assim que a senha é definida. Usuário fica com active=false até lá.
   inviteToken          String?   @unique
   inviteTokenExpiresAt DateTime?
+  /// Token de redefinição de senha ("esqueci minha senha"). Único e de uso
+  /// único; limpo assim que a nova senha é definida ou o token expira.
+  resetPasswordToken          String?   @unique
+  resetPasswordTokenExpiresAt DateTime?
   createdAt    DateTime @default(now())
   updatedAt    DateTime @updatedAt
 
@@ -906,6 +913,35 @@ model TicketReply {
 
   @@index([ticketId])
   @@map("ticket_replies")
+}
+
+/// Trilha de auditoria genérica (LGPD Art. 37 — registro das operações de
+/// tratamento; ISO 27001 A.8.15; OWASP A09:2021). Registra ações administrativas
+/// sensíveis: exportações de PII, logins, mudanças de permissão, exclusões.
+/// Sem FKs propositalmente: a trilha deve sobreviver à exclusão de usuários
+/// e empresas (accountability perante a ANPD).
+model AuditLog {
+  id         String   @id @default(cuid())
+  /// Tenant onde a ação ocorreu (null para ações de super-admin/plataforma).
+  companyId  String?
+  /// Usuário que executou a ação (null para tentativas anônimas, ex.: login falho).
+  actorId    String?
+  /// E-mail do ator no momento da ação (snapshot — sobrevive a alterações).
+  actorEmail String?
+  /// Ação em formato NAMESPACE_VERBO, ex.: EXPORT_WORKERS_PII, LOGIN_FAILED.
+  action     String
+  entityType String?
+  entityId   String?
+  /// IP de origem (respeitando TRUST_PROXY).
+  ip         String?
+  /// Contexto adicional (filtros de export, permissões alteradas, etc.).
+  meta       Json?
+  createdAt  DateTime @default(now())
+
+  @@index([companyId, createdAt])
+  @@index([actorId, createdAt])
+  @@index([action, createdAt])
+  @@map("audit_logs")
 }
 
 /// Registro de emails enviados — impede reenvio duplicado dentro da janela de dedup.

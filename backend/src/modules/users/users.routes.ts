@@ -1,6 +1,5 @@
 import { Router, type Request } from "express";
 import { z } from "zod";
-import bcrypt from "bcryptjs";
 import { Prisma, UserProfile } from "@prisma/client";
 import { prisma } from "../../lib/prisma.js";
 import { asyncHandler } from "../../middleware/async-handler.js";
@@ -13,6 +12,8 @@ import {
   type PermissionKey,
 } from "../../lib/permissions.js";
 import { hasCapability } from "../../lib/permissions.js";
+import { hashPassword } from "../../lib/password.js";
+import { auditContext, recordAudit } from "../../lib/audit.js";
 
 const router = Router();
 router.use(authenticate);
@@ -137,8 +138,15 @@ router.post(
     const data = createSchema.parse(req.body);
     const email = data.email.toLowerCase();
 
+    // Mensagem genérica: e-mail é único na plataforma inteira (cross-tenant);
+    // confirmar "já existe" permitiria enumerar contas de outros tenants
+    // (auditoria F16 — CWE-203).
     const existing = await prisma.user.findUnique({ where: { email } });
-    if (existing) throw BadRequest("Já existe um usuário com este e-mail.");
+    if (existing) {
+      throw BadRequest(
+        "Não foi possível concluir o cadastro com este e-mail. Verifique os dados ou use outro endereço.",
+      );
+    }
 
     if (data.contractorId) {
       const contractor = await prisma.contractor.findFirst({
@@ -148,7 +156,7 @@ router.post(
       if (!contractor) throw BadRequest("Fornecedor não encontrado.");
     }
 
-    const passwordHash = await bcrypt.hash(data.password, 10);
+    const passwordHash = await hashPassword(data.password);
     if (data.profile === "COLLABORATOR" && !data.contractorId) {
       throw BadRequest("Colaborador deve estar vinculado a uma empreiteira.");
     }
@@ -184,6 +192,14 @@ router.post(
       obraIds,
       permissions,
     );
+
+    await recordAudit({
+      ...auditContext(req),
+      action: "USER_CREATED",
+      entityType: "user",
+      entityId: created.id,
+      meta: { email, profile: data.profile, permissions },
+    });
 
     res.status(201).json(await publicUser(created));
   }),
@@ -234,7 +250,7 @@ router.patch(
             }
           : {}),
         ...(data.password
-          ? { passwordHash: await bcrypt.hash(data.password, 10) }
+          ? { passwordHash: await hashPassword(data.password) }
           : {}),
       },
     });
@@ -247,6 +263,27 @@ router.patch(
         nextPermissions,
       );
     }
+
+    const permissionsChanged =
+      data.permissions !== undefined &&
+      JSON.stringify(normalizePermissions(existing.permissions).sort()) !==
+        JSON.stringify([...nextPermissions].sort());
+
+    await recordAudit({
+      ...auditContext(req),
+      action: permissionsChanged ? "USER_PERMISSIONS_CHANGED" : "USER_UPDATED",
+      entityType: "user",
+      entityId: updated.id,
+      meta: {
+        changedFields: Object.keys(data),
+        ...(permissionsChanged
+          ? {
+              permissionsBefore: normalizePermissions(existing.permissions),
+              permissionsAfter: nextPermissions,
+            }
+          : {}),
+      },
+    });
 
     res.json(await publicUser(updated));
   }),

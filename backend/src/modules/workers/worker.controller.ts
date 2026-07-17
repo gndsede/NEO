@@ -14,6 +14,7 @@ import {
 import { BadRequest } from "../../lib/errors.js";
 import { scopeFromRequest } from "../../lib/scope.js";
 import { accessTokenPayload, presentWorker } from "./worker.present.js";
+import { auditContext, recordAudit } from "../../lib/audit.js";
 
 type MulterFiles = Record<string, Express.Multer.File[]> | undefined;
 
@@ -209,6 +210,14 @@ export const workerController = {
       String(req.params.id),
       req.user!.id,
     );
+    // LGPD Art. 37 — o exercício do direito de apagamento fica registrado
+    // na trilha de auditoria (sem PII: apenas o id da entidade).
+    await recordAudit({
+      ...auditContext(req),
+      action: "WORKER_ANONYMIZED",
+      entityType: "worker",
+      entityId: String(req.params.id),
+    });
     res.json(result);
   },
 };

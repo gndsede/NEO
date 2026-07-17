@@ -13,10 +13,7 @@ import { prisma } from "../../lib/prisma.js";
 import { asyncHandler } from "../../middleware/async-handler.js";
 import { authenticate, requireCapability } from "../../middleware/auth.js";
 import { Unauthorized } from "../../lib/errors.js";
-import {
-  isValidNeoAccessToken,
-  normalizeScannedQr,
-} from "../../utils/access-hash.js";
+import { resolveScannedToken } from "../../utils/access-hash.js";
 import { rewritePublicUrl } from "../../lib/public-url.js";
 import { resolveNextDirection } from "./access.direction.js";
 
@@ -133,7 +130,9 @@ router.post(
   asyncHandler(async (req, res) => {
     const company = companyId(req);
     const { qr, direction: requestedDirection, gate, override } = scanSchema.parse(req.body);
-    const token = normalizeScannedQr(qr);
+    // Verifica assinatura HMAC do crachá (quando presente) e extrai o token base.
+    const resolved = resolveScannedToken(qr);
+    const token = resolved.token;
 
     const deny = async (
       reason: string,
@@ -149,15 +148,15 @@ router.post(
           result: AccessResult.DENIED,
           reason,
           gate,
-          qrHash: isValidNeoAccessToken(token) ? token : null,
+          qrHash: token,
           operatorId: req.user!.id,
         },
       });
       return res.status(403).json({ result: "DENIED", reason, direction: directionForLog, log, ...extra });
     };
 
-    if (!isValidNeoAccessToken(token)) {
-      return deny("QR inválido — formato esperado: NEO-0A0AA0");
+    if (!token) {
+      return deny(resolved.error ?? "QR inválido — formato esperado: NEO-0A0AA0");
     }
 
     // Busca o colaborador pelo token
@@ -380,7 +379,9 @@ router.post(
     }>;
 
     for (const item of items) {
-      const token = normalizeScannedQr(item.qr);
+      // Verifica assinatura HMAC do crachá (quando presente) e extrai o token base.
+      const itemResolved = resolveScannedToken(item.qr);
+      const token = itemResolved.token;
       const occurredAt = item.occurredAt ? new Date(item.occurredAt) : new Date();
 
       if (item.clientId) {
@@ -416,7 +417,7 @@ router.post(
             occurredAt,
             result: AccessResult.DENIED,
             reason,
-            qrHash: isValidNeoAccessToken(token) ? token : null,
+            qrHash: token,
           },
         });
         results.push({
@@ -428,8 +429,11 @@ router.post(
         });
       };
 
-      if (!isValidNeoAccessToken(token)) {
-        await recordDeny("QR inválido — formato esperado: NEO-0A0AA0", item.direction ?? AccessDirection.ENTRY);
+      if (!token) {
+        await recordDeny(
+          itemResolved.error ?? "QR inválido — formato esperado: NEO-0A0AA0",
+          item.direction ?? AccessDirection.ENTRY,
+        );
         continue;
       }
 

@@ -4,7 +4,7 @@ import { prisma } from "../../lib/prisma.js";
 import { NotFound } from "../../lib/errors.js";
 import { decrypt } from "../../lib/crypto.js";
 import { workerScopeWhere, type AuthScope } from "../../lib/scope.js";
-import { NEO_QR_SPEC } from "../../utils/access-hash.js";
+import { buildSignedQrPayload, NEO_QR_SPEC } from "../../utils/access-hash.js";
 
 /**
  * Estrutura serializável do crachá. Pensada para ser consumida tanto pelo
@@ -109,7 +109,9 @@ export class BadgeService {
     if (!assignment) throw NotFound("Colaborador sem vínculo com obra");
 
     const token = worker.qrHash;
-    const qrCodeDataUrl = await QRCode.toDataURL(token, {
+    // O QR impresso carrega o payload assinado (HMAC) — um crachá reproduzido
+    // a partir de um token adivinhado/forjado não passa na verificação do scan.
+    const qrCodeDataUrl = await QRCode.toDataURL(buildSignedQrPayload(token), {
       errorCorrectionLevel: "M",
       margin: 1,
       width: 320,

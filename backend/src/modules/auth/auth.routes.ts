@@ -1,18 +1,31 @@
+import { randomBytes } from "node:crypto";
 import { Router } from "express";
 import { z } from "zod";
-import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 import { authenticator } from "otplib";
 import QRCode from "qrcode";
 import { prisma } from "../../lib/prisma.js";
 import { asyncHandler } from "../../middleware/async-handler.js";
 import { authenticate, signUserToken } from "../../middleware/auth.js";
-import { loginRateLimit } from "../../middleware/rate-limit.js";
+import {
+  loginRateLimit,
+  publicRateLimit,
+  twoFactorRateLimit,
+} from "../../middleware/rate-limit.js";
 import { BadRequest, Forbidden, NotFound, Unauthorized } from "../../lib/errors.js";
 import { hasAnyCapability, hasCapability, normalizePermissions } from "../../lib/permissions.js";
 import { loadObraIdsForUser } from "../../lib/scope.js";
 import { env } from "../../config/env.js";
-import { publicRateLimit } from "../../middleware/rate-limit.js";
+import { sendPasswordResetEmail } from "../../lib/password-reset-email.js";
+import { hashPassword, needsRehash, verifyPassword } from "../../lib/password.js";
+import {
+  consumeBackupCode,
+  generateBackupCodes,
+  looksLikeBackupCode,
+} from "../../lib/backup-codes.js";
+import { recordAudit } from "../../lib/audit.js";
+
+const RESET_PASSWORD_TOKEN_TTL_MS = 60 * 60 * 1000; // 1 hora
 
 const router = Router();
 
@@ -65,20 +78,10 @@ const totpCodeSchema = z.object({
     .regex(/^\d{6}$/, "Código TOTP deve ter 6 dígitos"),
 });
 
+// Aceita código TOTP (6 dígitos) OU código de backup (XXXX-XXXX, uso único).
 const login2faSchema = z.object({
   preAuthToken: z.string().min(1),
-  code: z
-    .string()
-    .trim()
-    .regex(/^\d{6}$/, "Código TOTP deve ter 6 dígitos"),
-});
-
-const mobileLoginSchema = z.object({
-  email: z.string().email(),
-  password: z.string().min(1),
-  code: z.string().trim().regex(/^\d{6}$/).optional(),
-  deviceId: z.string().min(1).max(120).optional(),
-  deviceName: z.string().min(1).max(120).optional(),
+  code: z.string().trim().min(6).max(12),
 });
 
 /** Bloqueia login de tenants bloqueados pelo super-admin ou com licença vencida. */
@@ -113,10 +116,37 @@ router.post(
         company: { select: { blocked: true, licenseExpiresAt: true } },
       },
     });
-    if (!user || !user.active) throw Unauthorized("Credenciais inválidas");
+    if (!user || !user.active) {
+      await recordAudit({
+        action: "LOGIN_FAILED",
+        actorEmail: normalizedEmail,
+        ip: req.ip ?? null,
+        meta: { flow: "web", reason: "unknown_or_inactive" },
+      });
+      throw Unauthorized("Credenciais inválidas");
+    }
 
-    const ok = await bcrypt.compare(password, user.passwordHash);
-    if (!ok) throw Unauthorized("Credenciais inválidas");
+    const ok = await verifyPassword(password, user.passwordHash);
+    if (!ok) {
+      await recordAudit({
+        action: "LOGIN_FAILED",
+        companyId: user.companyId,
+        actorId: user.id,
+        actorEmail: normalizedEmail,
+        ip: req.ip ?? null,
+        meta: { flow: "web", reason: "wrong_password" },
+      });
+      throw Unauthorized("Credenciais inválidas");
+    }
+
+    // Re-hash oportunista: eleva hashes antigos (custo 10) para o custo atual
+    // sem exigir troca de senha (auditoria F17 — OWASP ASVS V2.4).
+    if (needsRehash(user.passwordHash)) {
+      await prisma.user.update({
+        where: { id: user.id },
+        data: { passwordHash: await hashPassword(password) },
+      });
+    }
 
     ensureCompanyActive(user.company);
 
@@ -171,14 +201,50 @@ router.post(
     }
     ensureCompanyActive(user.company);
 
-    const valid = authenticator.check(code, user.totpSecret);
-    if (!valid) throw Unauthorized("Código TOTP inválido ou expirado");
+    // Código de backup (uso único) — alternativa para dispositivo TOTP perdido.
+    let usedBackupCode = false;
+    let newBackupCodes: string[] | null = null;
 
-    // Primeiro código válido após o enrolamento no login: ativa o 2FA
-    if (!user.totpEnabled) {
+    if (looksLikeBackupCode(code)) {
+      if (!user.totpEnabled) {
+        throw Unauthorized("Código TOTP inválido ou expirado");
+      }
+      const remaining = await consumeBackupCode(code, user.totpBackupCodes);
+      if (!remaining) throw Unauthorized("Código de backup inválido ou já utilizado");
       await prisma.user.update({
         where: { id: user.id },
-        data: { totpEnabled: true },
+        data: { totpBackupCodes: remaining },
+      });
+      usedBackupCode = true;
+      await recordAudit({
+        action: "TWO_FA_BACKUP_CODE_USED",
+        companyId: user.companyId,
+        actorId: user.id,
+        actorEmail: user.email,
+        ip: req.ip ?? null,
+        meta: { remainingCodes: remaining.length },
+      });
+    } else {
+      const valid = authenticator.check(code, user.totpSecret);
+      if (!valid) throw Unauthorized("Código TOTP inválido ou expirado");
+    }
+
+    // Primeiro código válido após o enrolamento no login: ativa o 2FA e gera
+    // os códigos de backup (exibidos uma única vez).
+    if (!user.totpEnabled) {
+      const generated = await generateBackupCodes();
+      newBackupCodes = generated.plainCodes;
+      await prisma.user.update({
+        where: { id: user.id },
+        data: { totpEnabled: true, totpBackupCodes: generated.hashes },
+      });
+      await recordAudit({
+        action: "TWO_FA_ENABLED",
+        companyId: user.companyId,
+        actorId: user.id,
+        actorEmail: user.email,
+        ip: req.ip ?? null,
+        meta: { flow: "web-enrollment" },
       });
     }
 
@@ -195,19 +261,36 @@ router.post(
       orderBy: { name: "asc" },
     });
 
-    const token = signUserToken({
-      id: user.id,
+    // Sessão web mais curta que a do app da catraca (token vive em
+    // localStorage — auditoria F08, OWASP ASVS V3).
+    const token = signUserToken(
+      {
+        id: user.id,
+        companyId: user.companyId,
+        profile: user.profile,
+        email: user.email,
+        contractorId: user.contractorId,
+        permissions,
+        obraIds,
+        activeObraId: obras[0]?.id ?? null,
+      },
+      { expiresIn: env.JWT_EXPIRES_IN_WEB },
+    );
+
+    await recordAudit({
+      action: "LOGIN_SUCCESS",
       companyId: user.companyId,
-      profile: user.profile,
-      email: user.email,
-      contractorId: user.contractorId,
-      permissions,
-      obraIds,
-      activeObraId: obras[0]?.id ?? null,
+      actorId: user.id,
+      actorEmail: user.email,
+      ip: req.ip ?? null,
+      meta: { flow: "web", usedBackupCode },
     });
 
     res.json({
       token,
+      // Presente apenas no primeiro login após o enrolamento do 2FA —
+      // o frontend deve exibir e orientar o usuário a guardar em local seguro.
+      ...(newBackupCodes ? { backupCodes: newBackupCodes } : {}),
       user: {
         id: user.id,
         name: user.name,
@@ -310,6 +393,7 @@ router.get(
  */
 router.post(
   "/2fa/enable",
+  twoFactorRateLimit,
   authenticate,
   asyncHandler(async (req, res) => {
     const scope = req.user!;
@@ -332,14 +416,75 @@ router.post(
       );
     }
 
+    const backupCodes = await generateBackupCodes();
+
     await prisma.user.update({
       where: { id: scope.id },
-      data: { totpEnabled: true },
+      data: { totpEnabled: true, totpBackupCodes: backupCodes.hashes },
+    });
+
+    await recordAudit({
+      action: "TWO_FA_ENABLED",
+      companyId: scope.companyId,
+      actorId: scope.id,
+      actorEmail: scope.email,
+      ip: req.ip ?? null,
     });
 
     res.json({
       success: true,
       message: "Autenticação em dois fatores ativada com sucesso.",
+      // Exibidos UMA única vez — o usuário deve guardá-los em local seguro.
+      backupCodes: backupCodes.plainCodes,
+      backupCodesNotice:
+        "Guarde estes códigos de backup em local seguro. Cada um pode ser usado uma única vez caso você perca o acesso ao aplicativo autenticador.",
+    });
+  }),
+);
+
+/**
+ * POST /auth/2fa/backup-codes
+ * Regenera os códigos de backup (invalida todos os anteriores).
+ * Exige o código TOTP atual para confirmar a posse do dispositivo.
+ */
+router.post(
+  "/2fa/backup-codes",
+  twoFactorRateLimit,
+  authenticate,
+  asyncHandler(async (req, res) => {
+    const scope = req.user!;
+    const { code } = totpCodeSchema.parse(req.body);
+
+    const user = await prisma.user.findUnique({
+      where: { id: scope.id },
+      select: { totpSecret: true, totpEnabled: true },
+    });
+    if (!user?.totpEnabled || !user.totpSecret) {
+      throw BadRequest("2FA não está ativado.");
+    }
+    if (!authenticator.check(code, user.totpSecret)) {
+      throw Unauthorized("Código TOTP inválido.");
+    }
+
+    const backupCodes = await generateBackupCodes();
+    await prisma.user.update({
+      where: { id: scope.id },
+      data: { totpBackupCodes: backupCodes.hashes },
+    });
+
+    await recordAudit({
+      action: "TWO_FA_BACKUP_CODES_REGENERATED",
+      companyId: scope.companyId,
+      actorId: scope.id,
+      actorEmail: scope.email,
+      ip: req.ip ?? null,
+    });
+
+    res.json({
+      success: true,
+      backupCodes: backupCodes.plainCodes,
+      backupCodesNotice:
+        "Códigos anteriores foram invalidados. Guarde os novos em local seguro.",
     });
   }),
 );
@@ -350,6 +495,7 @@ router.post(
  */
 router.delete(
   "/2fa/disable",
+  twoFactorRateLimit,
   authenticate,
   asyncHandler(async (req, res) => {
     const scope = req.user!;
@@ -369,7 +515,15 @@ router.delete(
 
     await prisma.user.update({
       where: { id: scope.id },
-      data: { totpEnabled: false, totpSecret: null },
+      data: { totpEnabled: false, totpSecret: null, totpBackupCodes: [] },
+    });
+
+    await recordAudit({
+      action: "TWO_FA_DISABLED",
+      companyId: scope.companyId,
+      actorId: scope.id,
+      actorEmail: scope.email,
+      ip: req.ip ?? null,
     });
 
     res.json({
@@ -386,7 +540,8 @@ router.delete(
 const mobileLoginSchemaFull = z.object({
   email: z.string().email(),
   password: z.string().min(1),
-  code: z.string().trim().regex(/^\d{6}$/).optional(),
+  // TOTP (6 dígitos) ou código de backup (XXXX-XXXX).
+  code: z.string().trim().min(6).max(12).optional(),
   deviceId: z.string().min(1).max(120).optional(),
   deviceName: z.string().min(1).max(120).optional(),
 });
@@ -406,10 +561,36 @@ router.post(
         },
       },
     });
-    if (!user || !user.active) throw Unauthorized("Credenciais inválidas");
+    if (!user || !user.active) {
+      await recordAudit({
+        action: "LOGIN_FAILED",
+        actorEmail: normalizedEmail,
+        ip: req.ip ?? null,
+        meta: { flow: "mobile", reason: "unknown_or_inactive" },
+      });
+      throw Unauthorized("Credenciais inválidas");
+    }
 
-    const ok = await bcrypt.compare(password, user.passwordHash);
-    if (!ok) throw Unauthorized("Credenciais inválidas");
+    const ok = await verifyPassword(password, user.passwordHash);
+    if (!ok) {
+      await recordAudit({
+        action: "LOGIN_FAILED",
+        companyId: user.companyId,
+        actorId: user.id,
+        actorEmail: normalizedEmail,
+        ip: req.ip ?? null,
+        meta: { flow: "mobile", reason: "wrong_password" },
+      });
+      throw Unauthorized("Credenciais inválidas");
+    }
+
+    // Re-hash oportunista (custo 10 → 12), ver /login.
+    if (needsRehash(user.passwordHash)) {
+      await prisma.user.update({
+        where: { id: user.id },
+        data: { passwordHash: await hashPassword(password) },
+      });
+    }
 
     ensureCompanyActive(user.company);
 
@@ -420,6 +601,9 @@ router.post(
         "Este usuário não tem permissão para operar a catraca. Peça ao administrador as permissões «Visualizar catraca» ou «Registrar acessos manualmente».",
       );
     }
+
+    // Códigos de backup gerados no enrolamento mobile (exibidos uma única vez).
+    let mobileBackupCodes: string[] | null = null;
 
     // 2FA ainda não configurado: enrolamento no próprio app (como no painel web).
     if (!user.totpEnabled || !user.totpSecret) {
@@ -451,13 +635,39 @@ router.post(
         throw Unauthorized("Código TOTP inválido ou expirado");
       }
       if (!user.totpEnabled) {
+        const generated = await generateBackupCodes();
+        mobileBackupCodes = generated.plainCodes;
         await prisma.user.update({
           where: { id: user.id },
-          data: { totpEnabled: true },
+          data: { totpEnabled: true, totpBackupCodes: generated.hashes },
+        });
+        await recordAudit({
+          action: "TWO_FA_ENABLED",
+          companyId: user.companyId,
+          actorId: user.id,
+          actorEmail: user.email,
+          ip: req.ip ?? null,
+          meta: { flow: "mobile-enrollment" },
         });
       }
     } else if (!code) {
       return res.json({ requires2FA: true, preAuthToken: signPreAuthToken(user.id, user.companyId) });
+    } else if (looksLikeBackupCode(code)) {
+      // Código de backup (uso único) — dispositivo TOTP perdido.
+      const remaining = await consumeBackupCode(code, user.totpBackupCodes);
+      if (!remaining) throw Unauthorized("Código de backup inválido ou já utilizado");
+      await prisma.user.update({
+        where: { id: user.id },
+        data: { totpBackupCodes: remaining },
+      });
+      await recordAudit({
+        action: "TWO_FA_BACKUP_CODE_USED",
+        companyId: user.companyId,
+        actorId: user.id,
+        actorEmail: user.email,
+        ip: req.ip ?? null,
+        meta: { flow: "mobile", remainingCodes: remaining.length },
+      });
     } else if (!authenticator.check(code, user.totpSecret)) {
       throw Unauthorized("Código TOTP inválido ou expirado");
     }
@@ -485,10 +695,20 @@ router.post(
       activeObraId: obras[0]?.id ?? null,
     });
 
+    await recordAudit({
+      action: "LOGIN_MOBILE_SUCCESS",
+      companyId: user.companyId,
+      actorId: user.id,
+      actorEmail: user.email,
+      ip: req.ip ?? null,
+      meta: { deviceId: deviceId ?? null, deviceName: deviceName ?? null },
+    });
+
     res.json({
       token,
       serverTime: new Date().toISOString(),
       device: deviceId ? { id: deviceId, name: deviceName ?? null } : null,
+      ...(mobileBackupCodes ? { backupCodes: mobileBackupCodes } : {}),
       user: {
         id: user.id,
         name: user.name,
@@ -547,7 +767,7 @@ router.post(
     if (!invite) throw NotFound("Convite inválido ou expirado.");
 
     const { password } = acceptInviteSchema.parse(req.body);
-    const passwordHash = await bcrypt.hash(password, 10);
+    const passwordHash = await hashPassword(password);
 
     await prisma.user.update({
       where: { id: invite.id },
@@ -557,6 +777,124 @@ router.post(
         inviteToken: null,
         inviteTokenExpiresAt: null,
       },
+    });
+
+    res.json({ success: true });
+  }),
+);
+
+// ---------------------------------------------------------------------------
+// Esqueci minha senha
+// ---------------------------------------------------------------------------
+
+const forgotPasswordSchema = z.object({
+  email: z.string().email(),
+});
+
+// POST /auth/forgot-password — gera token e envia e-mail de redefinição.
+// Resposta sempre genérica (mesmo se o e-mail não existir), para não permitir
+// enumeração de contas cadastradas.
+router.post(
+  "/forgot-password",
+  publicRateLimit,
+  asyncHandler(async (req, res) => {
+    const { email } = forgotPasswordSchema.parse(req.body);
+    const normalizedEmail = email.trim().toLowerCase();
+
+    const user = await prisma.user.findFirst({
+      where: { email: { equals: normalizedEmail, mode: "insensitive" }, active: true },
+    });
+
+    if (user) {
+      const resetPasswordToken = randomBytes(32).toString("hex");
+      const resetPasswordTokenExpiresAt = new Date(Date.now() + RESET_PASSWORD_TOKEN_TTL_MS);
+
+      await prisma.user.update({
+        where: { id: user.id },
+        data: { resetPasswordToken, resetPasswordTokenExpiresAt },
+      });
+
+      await sendPasswordResetEmail({
+        recipientEmail: user.email,
+        resetToken: resetPasswordToken,
+      });
+
+      await recordAudit({
+        action: "PASSWORD_RESET_REQUESTED",
+        companyId: user.companyId,
+        actorId: user.id,
+        actorEmail: user.email,
+        ip: req.ip ?? null,
+      });
+    }
+
+    res.json({
+      success: true,
+      message:
+        "Se houver uma conta com este e-mail, você receberá um link para redefinir sua senha.",
+    });
+  }),
+);
+
+async function findValidPasswordReset(token: string) {
+  const user = await prisma.user.findUnique({
+    where: { resetPasswordToken: token },
+    select: {
+      id: true,
+      email: true,
+      resetPasswordTokenExpiresAt: true,
+    },
+  });
+  if (
+    !user ||
+    !user.resetPasswordTokenExpiresAt ||
+    user.resetPasswordTokenExpiresAt < new Date()
+  ) {
+    return null;
+  }
+  return user;
+}
+
+// GET /auth/reset-password/:token — valida o token e devolve dados para a tela de redefinição
+router.get(
+  "/reset-password/:token",
+  publicRateLimit,
+  asyncHandler(async (req, res) => {
+    const reset = await findValidPasswordReset(String(req.params.token));
+    if (!reset) throw NotFound("Link de redefinição inválido ou expirado.");
+    res.json({ email: reset.email });
+  }),
+);
+
+const resetPasswordSchema = z.object({
+  password: z.string().min(8, "A senha deve ter ao menos 8 caracteres"),
+});
+
+// POST /auth/reset-password/:token — define a nova senha
+router.post(
+  "/reset-password/:token",
+  publicRateLimit,
+  asyncHandler(async (req, res) => {
+    const reset = await findValidPasswordReset(String(req.params.token));
+    if (!reset) throw NotFound("Link de redefinição inválido ou expirado.");
+
+    const { password } = resetPasswordSchema.parse(req.body);
+    const passwordHash = await hashPassword(password);
+
+    await prisma.user.update({
+      where: { id: reset.id },
+      data: {
+        passwordHash,
+        resetPasswordToken: null,
+        resetPasswordTokenExpiresAt: null,
+      },
+    });
+
+    await recordAudit({
+      action: "PASSWORD_RESET_COMPLETED",
+      actorId: reset.id,
+      actorEmail: reset.email,
+      ip: req.ip ?? null,
     });
 
     res.json({ success: true });

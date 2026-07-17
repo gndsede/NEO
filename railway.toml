@@ -1,3 +1,17 @@
+# ----------------------------------------------------------------------------
+# Variáveis OBRIGATÓRIAS em Railway → Variables (o boot falha sem elas):
+#   DATABASE_URL       — referência ao Postgres do projeto
+#   JWT_SECRET         — openssl rand -hex 32 (exclusivo de produção)
+#   BADGE_HASH_SECRET  — openssl rand -hex 32 (exclusivo de produção)
+#   CORS_ORIGIN        — origem(ns) do frontend, ex.: https://app.exemplo.com.br
+#   TRUST_PROXY=1      — a API roda atrás do load balancer do Railway; sem isso
+#                        o rate limit por IP enxerga só o IP do proxy e a
+#                        proteção contra força bruta é neutralizada (F10).
+#   ENCRYPTION_KEY     — hex de 64 chars (AES-256 de CPF/RG); NUNCA rotacionar
+#                        depois de ativada sem plano de re-cifragem.
+# Recomendadas: RESEND_API_KEY, FRONTEND_URL, STORAGE_DRIVER (+credenciais).
+# ----------------------------------------------------------------------------
+
 [build]
 builder = "DOCKERFILE"
 dockerfilePath = "Dockerfile"

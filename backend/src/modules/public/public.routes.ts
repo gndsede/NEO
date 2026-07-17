@@ -1,11 +1,10 @@
 import { Router } from "express";
-import { prisma } from "../../lib/prisma.js";
 import { asyncHandler } from "../../middleware/async-handler.js";
 import { publicRateLimit } from "../../middleware/rate-limit.js";
 import {
   isValidNeoAccessToken,
   NEO_QR_SPEC,
-  normalizeScannedQr,
+  resolveScannedToken,
 } from "../../utils/access-hash.js";
 
 const router = Router();
@@ -19,62 +18,59 @@ router.get(
   (_req, res) => {
     res.json({
       spec: NEO_QR_SPEC,
-      qrPayload: "O conteúdo do QR Code deve ser exatamente o token (ex.: NEO-3K7BM2).",
+      qrPayload:
+        "O conteúdo do QR Code deve ser o payload assinado fornecido pela plataforma (campo qrPayload do colaborador, ex.: NEO-3K7BM2-1A2B3C4D).",
       integration: {
-        encode: "Gere o QR Code com o valor literal do campo accessToken do colaborador.",
-        scan: "A catraca aceita o token lido diretamente ou via URL com parâmetro ?t=TOKEN.",
+        encode:
+          "Gere o QR Code com o valor literal do campo qrPayload do colaborador (token + assinatura HMAC). Não construa o payload manualmente.",
+        scan: "A catraca aceita o payload lido diretamente ou via URL com parâmetro ?t=PAYLOAD.",
       },
     });
   },
 );
 
 /**
- * Consulta pública de token — permite que TI de empreiteiras valide o formato
- * e obtenha o payload exato para gerar QR Codes próprios.
+ * Validação pública de payload de QR — permite que TI de empreiteiras confira
+ * se um QR gerado está bem formado e com assinatura íntegra.
+ *
+ * Endurecido (auditoria F15/F02 — OWASP API3:2023/API9:2023):
+ *  - NENHUMA consulta ao banco: este endpoint não confirma existência de
+ *    colaborador nem revela obra/empresa — apenas valida formato e assinatura.
+ *  - Sem assinatura válida, um token "de formato correto" não é confirmado,
+ *    eliminando o oráculo que ajudava a clonar crachás por enumeração.
  */
 router.get(
   "/access-tokens/:token",
   asyncHandler(async (req, res) => {
-    const token = normalizeScannedQr(String(req.params.token));
+    const raw = String(req.params.token);
+    const resolved = resolveScannedToken(raw);
 
-    if (!isValidNeoAccessToken(token)) {
-      res.status(400).json({
+    // Payload assinado com HMAC íntegro — único caso confirmado como válido.
+    if (resolved.token && resolved.signed) {
+      res.json({ valid: true, signed: true, spec: NEO_QR_SPEC });
+      return;
+    }
+
+    // Token legado sem assinatura: informa apenas validade de FORMATO,
+    // sem consultar o banco (não confirma se o token existe).
+    if (resolved.token || isValidNeoAccessToken(raw)) {
+      res.json({
         valid: false,
-        token,
-        qrPayload: null,
+        signed: false,
+        formatValid: true,
         spec: NEO_QR_SPEC,
-        error: "Formato inválido. Use o padrão NEO-0A0AA0 (0=dígito, A=letra).",
+        error:
+          "Payload sem assinatura. Use o campo qrPayload fornecido pela plataforma (token + assinatura HMAC).",
       });
       return;
     }
 
-    const worker = await prisma.worker.findUnique({
-      where: { qrHash: token },
-      select: {
-        id: true,
-        company: { select: { name: true, siteName: true } },
-        assignments: {
-          select: { status: true },
-          where: { status: "ACTIVE" },
-          take: 1,
-        },
-      },
-    });
-
-    // Expose only the minimal fields needed for QR-integration verification.
-    // fullName, registration, and contractor are omitted from this unauthenticated endpoint.
-    res.json({
-      valid: !!worker,
-      token,
-      qrPayload: token,
+    res.status(400).json({
+      valid: false,
+      signed: false,
+      formatValid: false,
       spec: NEO_QR_SPEC,
-      worker: worker
-        ? {
-            id: worker.id,
-            status: worker.assignments[0]?.status ?? "INACTIVE",
-            company: worker.company.siteName ?? worker.company.name,
-          }
-        : null,
+      error: "Formato inválido. Use o payload assinado fornecido pela plataforma.",
     });
   }),
 );

@@ -26,6 +26,9 @@ export const PERMISSION_CATALOG = [
   { group: "RDO", key: "rdo.view", label: "Visualizar RDOs" },
   { group: "RDO", key: "rdo.manage", label: "Criar e editar RDOs" },
   { group: "RDO", key: "rdo.approve", label: "Aprovar e reprovar RDOs" },
+  // Exports revelam CPF/RG completos (decriptados) — permissão dedicada,
+  // concedida apenas a perfis administrativos (LGPD Art. 6º, III/VII; OWASP API5:2023).
+  { group: "Relatórios", key: "relatorios.export_pii", label: "Exportar relatórios com CPF/RG" },
 ] as const;
 
 export type PermissionKey = (typeof PERMISSION_CATALOG)[number]["key"];

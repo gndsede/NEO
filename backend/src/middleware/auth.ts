@@ -42,7 +42,10 @@ export interface AccessTokenClaims {
   aud?: string;
 }
 
-export function signUserToken(user: AuthUser): string {
+export function signUserToken(
+  user: AuthUser,
+  options?: { expiresIn?: string },
+): string {
   const claims: AccessTokenClaims = {
     sub: user.id,
     companyId: user.companyId,
@@ -53,7 +56,8 @@ export function signUserToken(user: AuthUser): string {
     aud: ACCESS_TOKEN_AUDIENCE,
   };
   return jwt.sign(claims, env.JWT_SECRET, {
-    expiresIn: env.JWT_EXPIRES_IN as jwt.SignOptions["expiresIn"],
+    expiresIn: (options?.expiresIn ??
+      env.JWT_EXPIRES_IN) as jwt.SignOptions["expiresIn"],
   });
 }
 

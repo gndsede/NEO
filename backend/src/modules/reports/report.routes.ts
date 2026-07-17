@@ -18,6 +18,7 @@ import {
   reportContractorPending,
   reportWorkers,
 } from "./report.export.js";
+import { auditContext, recordAudit } from "../../lib/audit.js";
 
 const router = Router();
 router.use(authenticate);
@@ -208,23 +209,29 @@ function parseEffectiveStatus(raw: unknown): EffectiveRequirementStatus[] | unde
   return valid.length ? (valid as EffectiveRequirementStatus[]) : undefined;
 }
 
-// Exports contêm PII (CPF/RG) — restritos a quem tem acesso a relatórios.
-const canExport = requireCapability("dashboard.view");
+// Exports decriptam e revelam CPF/RG completos — exigem permissão dedicada
+// (não a permissão básica de dashboard), concedida só a perfis administrativos.
+// Cada exportação é registrada na trilha de auditoria: quem, quando, filtros
+// e formato (LGPD Art. 37/46; OWASP API5:2023; ISO 27001 A.5.15/A.8.15).
+const canExport = requireCapability("relatorios.export_pii");
 
 router.get(
   "/export/workers",
   canExport,
   asyncHandler(async (req, res) => {
     const scope = scopeFromRequest(req);
-    await reportWorkers(
-      scope,
-      {
-        contractorId: req.query.contractorId ? String(req.query.contractorId) : undefined,
-        status: req.query.status ? String(req.query.status) : undefined,
-      },
-      parseFormat(req),
-      res,
-    );
+    const filters = {
+      contractorId: req.query.contractorId ? String(req.query.contractorId) : undefined,
+      status: req.query.status ? String(req.query.status) : undefined,
+    };
+    const format = parseFormat(req);
+    await recordAudit({
+      ...auditContext(req),
+      action: "EXPORT_WORKERS_PII",
+      entityType: "report",
+      meta: { format, filters },
+    });
+    await reportWorkers(scope, filters, format, res);
   }),
 );
 
@@ -233,15 +240,18 @@ router.get(
   canExport,
   asyncHandler(async (req, res) => {
     const scope = scopeFromRequest(req);
-    await reportCompliance(
-      scope,
-      {
-        contractorId: req.query.contractorId ? String(req.query.contractorId) : undefined,
-        effectiveStatus: parseEffectiveStatus(req.query.effectiveStatus),
-      },
-      parseFormat(req),
-      res,
-    );
+    const filters = {
+      contractorId: req.query.contractorId ? String(req.query.contractorId) : undefined,
+      effectiveStatus: parseEffectiveStatus(req.query.effectiveStatus),
+    };
+    const format = parseFormat(req);
+    await recordAudit({
+      ...auditContext(req),
+      action: "EXPORT_COMPLIANCE_PII",
+      entityType: "report",
+      meta: { format, filters },
+    });
+    await reportCompliance(scope, filters, format, res);
   }),
 );
 
@@ -252,16 +262,19 @@ router.get(
     const scope = scopeFromRequest(req);
     const from = req.query.from ? new Date(String(req.query.from)) : undefined;
     const to = req.query.to ? new Date(String(req.query.to)) : undefined;
-    await reportAccess(
-      scope,
-      {
-        from: from && !Number.isNaN(from.getTime()) ? from : undefined,
-        to: to && !Number.isNaN(to.getTime()) ? to : undefined,
-        obraId: req.query.obraId ? String(req.query.obraId) : undefined,
-      },
-      parseFormat(req),
-      res,
-    );
+    const filters = {
+      from: from && !Number.isNaN(from.getTime()) ? from : undefined,
+      to: to && !Number.isNaN(to.getTime()) ? to : undefined,
+      obraId: req.query.obraId ? String(req.query.obraId) : undefined,
+    };
+    const format = parseFormat(req);
+    await recordAudit({
+      ...auditContext(req),
+      action: "EXPORT_ACCESS_PII",
+      entityType: "report",
+      meta: { format, filters },
+    });
+    await reportAccess(scope, filters, format, res);
   }),
 );
 
@@ -270,14 +283,17 @@ router.get(
   canExport,
   asyncHandler(async (req, res) => {
     const scope = scopeFromRequest(req);
-    await reportContractorPending(
-      scope,
-      {
-        obraId: req.query.obraId ? String(req.query.obraId) : undefined,
-      },
-      parseFormat(req),
-      res,
-    );
+    const filters = {
+      obraId: req.query.obraId ? String(req.query.obraId) : undefined,
+    };
+    const format = parseFormat(req);
+    await recordAudit({
+      ...auditContext(req),
+      action: "EXPORT_CONTRACTOR_PENDING",
+      entityType: "report",
+      meta: { format, filters },
+    });
+    await reportContractorPending(scope, filters, format, res);
   }),
 );
 

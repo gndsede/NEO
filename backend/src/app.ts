@@ -24,12 +24,8 @@ export function createApp() {
     app.set("trust proxy", env.TRUST_PROXY);
   }
 
-  if (!isDev && env.CORS_ORIGIN === "*") {
-    // eslint-disable-next-line no-console
-    console.warn(
-      "⚠️  CORS_ORIGIN='*' em produção. Configure a(s) origem(ns) do frontend (ex.: https://app.suaempresa.com.br).",
-    );
-  }
+  // CORS_ORIGIN='*' em produção derruba o boot (validado em config/env.ts);
+  // aqui só resta o caso dev/test.
 
   app.use(
     helmet({

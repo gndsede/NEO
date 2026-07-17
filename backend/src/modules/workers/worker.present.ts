@@ -1,6 +1,6 @@
 import { RequirementCollectionStatus } from "@prisma/client";
 import type { AuthScope } from "../../lib/scope.js";
-import { NEO_QR_SPEC } from "../../utils/access-hash.js";
+import { buildSignedQrPayload, NEO_QR_SPEC } from "../../utils/access-hash.js";
 
 type WorkerWithToken = { qrHash: string };
 
@@ -110,8 +110,9 @@ export function withAccessToken<T extends WorkerWithToken>(
 export function accessTokenPayload(qrHash: string) {
   return {
     accessToken: qrHash,
-    qrPayload: qrHash,
-    format: NEO_QR_SPEC.pattern,
+    // QRs novos devem embutir o payload assinado (HMAC), não o token cru.
+    qrPayload: buildSignedQrPayload(qrHash),
+    format: NEO_QR_SPEC.signedPattern,
     spec: NEO_QR_SPEC,
   };
 }
