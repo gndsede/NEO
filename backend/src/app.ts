@@ -77,10 +77,10 @@ export function createApp() {
 
     // Assina automaticamente URLs /files presentes em qualquer resposta JSON
     // da API, para que o frontend receba links prontos e temporários.
-    app.use("/api", (_req, res, next) => {
+    app.use("/api", (req, res, next) => {
       const original = res.json.bind(res);
       res.json = ((body: unknown) =>
-        original(signFileUrlsDeep(body))) as typeof res.json;
+        original(signFileUrlsDeep(body, req))) as typeof res.json;
       next();
     });
   }
