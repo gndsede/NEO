@@ -4,6 +4,11 @@ import {
   sendExpiryDigest,
   type ExpiryItem,
 } from "./notification.service.js";
+import { logger } from "../../lib/logger.js";
+import {
+  registerScheduler,
+  withSchedulerTracking,
+} from "../../lib/scheduler-health.js";
 
 const CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000; // 1x por dia
 
@@ -107,20 +112,21 @@ async function processGroup(items: ItemRow[], expired: boolean): Promise<void> {
 
   if (sent > 0) {
     const label = expired ? "vencidos" : "vencendo";
-    // eslint-disable-next-line no-console
-    console.log(`[notifications] ${sent} digest(s) de documentos ${label} enviado(s).`);
+    logger.info("notification_digest_sent", { count: sent, label });
   }
 }
+
+const SCHEDULER_NAME = "notifications";
+registerScheduler(SCHEDULER_NAME);
 
 export function startNotificationScheduler(): void {
   if (intervalRef) return;
 
   const run = async () => {
     try {
-      await tick();
+      await withSchedulerTracking(SCHEDULER_NAME, tick);
     } catch (e) {
-      // eslint-disable-next-line no-console
-      console.error("[notifications] erro no tick:", e);
+      logger.error("notification_tick_failed", { err: e });
     }
   };
 

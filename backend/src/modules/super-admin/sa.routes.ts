@@ -14,6 +14,8 @@ import { env } from "../../config/env.js";
 import { fullPermissions } from "../../lib/permissions.js";
 import { sendTenantInviteEmail } from "../../lib/invite-email.js";
 import { hashPassword } from "../../lib/password.js";
+import { cache } from "../../lib/cache.js";
+import { observabilityRoutes } from "./observability/observability.routes.js";
 
 const INVITE_TOKEN_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 dias
 
@@ -232,6 +234,10 @@ router.post(
 
 router.use(saAuth);
 
+// Observabilidade/debugging (request logs, erros, métricas, cache, alertas)
+// — exclusivo do super-admin, herda saAuth por estar montado após a linha acima.
+router.use("/observability", observabilityRoutes);
+
 // GET /super-admin/me — dados do admin autenticado (inclui status do 2FA)
 router.get(
   "/me",
@@ -340,34 +346,40 @@ router.delete(
 router.get(
   "/dashboard",
   asyncHandler(async (_req, res) => {
-    const [totalTenants, activeTenants, blockedTenants, recentTenants] = await Promise.all([
-      prisma.company.count(),
-      prisma.company.count({ where: { active: true, blocked: false } }),
-      prisma.company.count({ where: { blocked: true } }),
-      prisma.company.findMany({
-        orderBy: { createdAt: "desc" },
-        take: 5,
-        select: { id: true, name: true, plan: true, createdAt: true, active: true, blocked: true },
-      }),
-    ]);
+    // Agregação de várias contagens — cache curto (30s) evita recalcular a
+    // cada refresh do painel; hit/miss visível em /observability/cache.
+    const dashboard = await cache.wrap("sa:dashboard", 30_000, async () => {
+      const [totalTenants, activeTenants, blockedTenants, recentTenants] = await Promise.all([
+        prisma.company.count(),
+        prisma.company.count({ where: { active: true, blocked: false } }),
+        prisma.company.count({ where: { blocked: true } }),
+        prisma.company.findMany({
+          orderBy: { createdAt: "desc" },
+          take: 5,
+          select: { id: true, name: true, plan: true, createdAt: true, active: true, blocked: true },
+        }),
+      ]);
 
-    const [pendingInvoices, openTickets, totalContracts] = await Promise.all([
-      prisma.saInvoice.count({ where: { status: "PENDING" } }),
-      prisma.supportTicket.count({ where: { status: { in: ["OPEN", "IN_PROGRESS"] } } }),
-      prisma.saContract.count(),
-    ]);
+      const [pendingInvoices, openTickets, totalContracts] = await Promise.all([
+        prisma.saInvoice.count({ where: { status: "PENDING" } }),
+        prisma.supportTicket.count({ where: { status: { in: ["OPEN", "IN_PROGRESS"] } } }),
+        prisma.saContract.count(),
+      ]);
 
-    res.json({
-      stats: {
-        totalTenants,
-        activeTenants,
-        blockedTenants,
-        pendingInvoices,
-        openTickets,
-        totalContracts,
-      },
-      recentTenants,
+      return {
+        stats: {
+          totalTenants,
+          activeTenants,
+          blockedTenants,
+          pendingInvoices,
+          openTickets,
+          totalContracts,
+        },
+        recentTenants,
+      };
     });
+
+    res.json(dashboard);
   }),
 );
 

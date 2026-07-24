@@ -13,6 +13,11 @@ import {
   startNotificationScheduler,
   stopNotificationScheduler,
 } from "./modules/notifications/notification.scheduler.js";
+import { startAlertScheduler, stopAlertScheduler } from "./lib/alert-engine.js";
+import {
+  startMetricSnapshotScheduler,
+  stopMetricSnapshotScheduler,
+} from "./lib/metric-snapshot.scheduler.js";
 
 async function bootstrap() {
   const app = createApp();
@@ -29,6 +34,8 @@ async function bootstrap() {
   startAutoExitScheduler();
   startRequirementStatusScheduler();
   startNotificationScheduler();
+  startMetricSnapshotScheduler();
+  startAlertScheduler();
 
   const shutdown = async (signal: string) => {
     // eslint-disable-next-line no-console
@@ -36,6 +43,8 @@ async function bootstrap() {
     stopAutoExitScheduler();
     stopRequirementStatusScheduler();
     stopNotificationScheduler();
+    stopMetricSnapshotScheduler();
+    stopAlertScheduler();
     server.close(async () => {
       await prisma.$disconnect();
       process.exit(0);

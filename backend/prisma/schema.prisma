@@ -977,3 +977,79 @@ model NotificationLog {
   @@index([companyId, sentAt])
   @@map("notification_logs")
 }
+
+// -----------------------------------------------------------------------
+// Observabilidade (painel Super Admin) — request id, erros, métricas e
+// alertas. Nada aqui é exposto a tenants; consumido só por
+// modules/super-admin/observability.
+// -----------------------------------------------------------------------
+
+/// Erro de requisição com stack trace completo, para debugging em produção.
+model ErrorLog {
+  id         String   @id @default(cuid())
+  requestId  String?
+  method     String
+  path       String
+  statusCode Int
+  message    String
+  stack      String?  @db.Text
+  /// Tenant/ator no momento do erro, quando disponível (null em rotas públicas/anônimas).
+  companyId  String?
+  actorId    String?
+  meta       Json?
+  createdAt  DateTime @default(now())
+
+  @@index([createdAt])
+  @@index([statusCode, createdAt])
+  @@map("error_logs")
+}
+
+/// Snapshot periódico de saúde do processo (memória/CPU/throughput/erro),
+/// para o processo sobreviver a restarts sem perder histórico recente.
+model MetricSnapshot {
+  id              String   @id @default(cuid())
+  takenAt         DateTime @default(now())
+  rssMb           Float
+  heapUsedMb      Float
+  cpuUserPct      Float
+  requestsPerMin  Float
+  avgLatencyMs    Float
+  errorRate       Float
+
+  @@index([takenAt])
+  @@map("metric_snapshots")
+}
+
+/// Regra de alerta configurável pelo super-admin (métrica x threshold).
+model AlertRule {
+  id              String    @id @default(cuid())
+  /// "ERROR_RATE" | "P95_LATENCY_MS" | "SLOW_QUERY_COUNT" | "DB_DOWN" | "MEMORY_RSS_MB"
+  metric          String
+  /// Sempre "gt" nesta primeira versão (valor atual > threshold dispara o alerta).
+  comparator      String    @default("gt")
+  threshold       Float
+  windowMinutes   Int       @default(5)
+  enabled         Boolean   @default(true)
+  recipientEmail  String
+  /// Evita spam de e-mail: só dispara de novo após esse intervalo.
+  cooldownMinutes Int       @default(30)
+  lastTriggeredAt DateTime?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+  events          AlertEvent[]
+
+  @@map("alert_rules")
+}
+
+/// Histórico de disparos de uma AlertRule.
+model AlertEvent {
+  id          String    @id @default(cuid())
+  ruleId      String
+  rule        AlertRule @relation(fields: [ruleId], references: [id], onDelete: Cascade)
+  metricValue Float
+  message     String
+  createdAt   DateTime  @default(now())
+
+  @@index([ruleId, createdAt])
+  @@map("alert_events")
+}

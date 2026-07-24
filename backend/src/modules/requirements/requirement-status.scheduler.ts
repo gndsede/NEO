@@ -1,7 +1,14 @@
 import { recomputeStaleStatuses } from "./requirement-status.js";
+import { logger } from "../../lib/logger.js";
+import {
+  registerScheduler,
+  withSchedulerTracking,
+} from "../../lib/scheduler-health.js";
 
 // A cada 6h reavalia vencimentos (VIGENTE → PROX_VENCIMENTO → VENCIDO).
 const CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000;
+const SCHEDULER_NAME = "requirement-status";
+registerScheduler(SCHEDULER_NAME);
 
 let intervalRef: ReturnType<typeof setInterval> | null = null;
 
@@ -10,14 +17,14 @@ export function startRequirementStatusScheduler(): void {
 
   const tick = async () => {
     try {
-      const changed = await recomputeStaleStatuses();
-      if (changed > 0) {
-        // eslint-disable-next-line no-console
-        console.log(`[req-status] ${changed} exigência(s) reavaliada(s).`);
-      }
+      await withSchedulerTracking(SCHEDULER_NAME, async () => {
+        const changed = await recomputeStaleStatuses();
+        if (changed > 0) {
+          logger.info("requirement_status_recomputed", { changed });
+        }
+      });
     } catch (e) {
-      // eslint-disable-next-line no-console
-      console.error("[req-status] erro no tick:", e);
+      logger.error("requirement_status_tick_failed", { err: e });
     }
   };
 

@@ -19,6 +19,7 @@ import {
   reportWorkers,
 } from "./report.export.js";
 import { auditContext, recordAudit } from "../../lib/audit.js";
+import { cache } from "../../lib/cache.js";
 
 const router = Router();
 router.use(authenticate);
@@ -51,7 +52,12 @@ router.get(
     const workerScope = workerScopeWhere(scope);
     const contractorScope = contractorScopeWhere(scope);
 
-    const [
+    // Agregação pesada (vários groupBy/count) — cache curto de 20s por
+    // combinação de tenant+escopo de obra/fornecedor, evita recomputar a
+    // cada carregamento do dashboard de compliance.
+    const cacheKey = `reports:compliance-overview:${companyIdValue}:${scope.activeObraId ?? "all"}:${scope.allObrasAccess}:${scope.contractorId ?? "none"}`;
+    const payload = await cache.wrap(cacheKey, 20_000, async () => {
+      const [
       workerStatusGroups,
       contractorStatusGroups,
       workersCount,
@@ -171,34 +177,37 @@ router.get(
     const sum = (s: Record<string, number>) =>
       Object.values(s).reduce((a, b) => a + b, 0);
 
-    res.json({
-      summary: { workers: workersCount, contractors: contractorsCount },
-      workers: {
-        total: workersCount,
-        totalRegistros: sum(workerStatus),
-        pendentes: workerStatus.NOT_SENT + workerStatus.PENDING_APPROVAL,
-        status: workerStatus,
-        chart: statusToChart(workerStatus),
-      },
-      contractors: {
-        total: contractorsCount,
-        totalRegistros: sum(contractorStatus),
-        pendentes: contractorStatus.NOT_SENT + contractorStatus.PENDING_APPROVAL,
-        status: contractorStatus,
-        chart: statusToChart(contractorStatus),
-      },
-      topWorkerRequirements: topWorkerReqGroups.map((g) => ({
-        name: g.name,
-        documentType: g.documentType,
-        count: g._count._all,
-      })),
-      topPendingContractors: topContractorReqGroups.map((g) => ({
-        name: nameById.get(g.contractorId) ?? "—",
-        count: g._count._all,
-      })),
-      requirementStatus: totals,
-      chart: statusToChart(totals),
+      return {
+        summary: { workers: workersCount, contractors: contractorsCount },
+        workers: {
+          total: workersCount,
+          totalRegistros: sum(workerStatus),
+          pendentes: workerStatus.NOT_SENT + workerStatus.PENDING_APPROVAL,
+          status: workerStatus,
+          chart: statusToChart(workerStatus),
+        },
+        contractors: {
+          total: contractorsCount,
+          totalRegistros: sum(contractorStatus),
+          pendentes: contractorStatus.NOT_SENT + contractorStatus.PENDING_APPROVAL,
+          status: contractorStatus,
+          chart: statusToChart(contractorStatus),
+        },
+        topWorkerRequirements: topWorkerReqGroups.map((g) => ({
+          name: g.name,
+          documentType: g.documentType,
+          count: g._count._all,
+        })),
+        topPendingContractors: topContractorReqGroups.map((g) => ({
+          name: nameById.get(g.contractorId) ?? "—",
+          count: g._count._all,
+        })),
+        requirementStatus: totals,
+        chart: statusToChart(totals),
+      };
     });
+
+    res.json(payload);
   }),
 );
 

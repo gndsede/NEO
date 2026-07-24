@@ -1,5 +1,13 @@
 import { AccessDirection, AccessResult } from "@prisma/client";
 import { prisma } from "../../lib/prisma.js";
+import { logger } from "../../lib/logger.js";
+import {
+  registerScheduler,
+  withSchedulerTracking,
+} from "../../lib/scheduler-health.js";
+
+const SCHEDULER_NAME = "auto-exit";
+registerScheduler(SCHEDULER_NAME);
 
 /** Fallback quando o colaborador não tem turno cadastrado. */
 const FALLBACK_MAX_AGE_MS = 8 * 60 * 60 * 1000; // 8 horas
@@ -136,14 +144,14 @@ export function startAutoExitScheduler(): void {
 
   const tick = async () => {
     try {
-      const inserted = await runAutoExitOnce();
-      if (inserted > 0) {
-        // eslint-disable-next-line no-console
-        console.log(`[auto-exit] ${inserted} saída(s) automática(s) registrada(s).`);
-      }
+      await withSchedulerTracking(SCHEDULER_NAME, async () => {
+        const inserted = await runAutoExitOnce();
+        if (inserted > 0) {
+          logger.info("auto_exit_run", { inserted });
+        }
+      });
     } catch (e) {
-      // eslint-disable-next-line no-console
-      console.error("[auto-exit] erro no tick:", e);
+      logger.error("auto_exit_tick_failed", { err: e });
     }
   };
 

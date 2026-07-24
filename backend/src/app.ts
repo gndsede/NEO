@@ -2,12 +2,13 @@ import path from "node:path";
 import express from "express";
 import cors from "cors";
 import helmet from "helmet";
-import morgan from "morgan";
 import { env } from "./config/env.js";
 import { apiRouter } from "./routes.js";
 import { errorHandler, notFoundHandler } from "./middleware/error-handler.js";
 import { apiRateLimit } from "./middleware/rate-limit.js";
 import { signFileUrlsDeep, verifyFileSignature } from "./lib/file-signing.js";
+import { requestContext } from "./middleware/request-context.js";
+import { accessLog } from "./middleware/access-log.js";
 
 export function createApp() {
   const app = express();
@@ -26,6 +27,10 @@ export function createApp() {
 
   // CORS_ORIGIN='*' em produção derruba o boot (validado em config/env.ts);
   // aqui só resta o caso dev/test.
+
+  // Primeiro middleware de todos: toda resposta (incl. 404 e rate-limit)
+  // carrega X-Request-Id e fica correlacionável nos logs/erros/métricas.
+  app.use(requestContext());
 
   app.use(
     helmet({
@@ -49,7 +54,8 @@ export function createApp() {
   );
   app.use(express.json({ limit: "2mb" }));
   app.use(express.urlencoded({ extended: true }));
-  app.use(morgan(env.NODE_ENV === "development" ? "dev" : "combined"));
+  // Log estruturado em JSON (substitui o morgan) + alimenta métricas por rota.
+  app.use(accessLog());
 
   // Healthcheck para plataformas de deploy (Railway, etc.)
   app.get("/health", (_req, res) => {
