@@ -279,6 +279,7 @@ router.post(
         log = await prisma.accessLog.update({
           where: { id: recentDenied.id },
           data: {
+            direction,
             result: AccessResult.GRANTED,
             reason: "Liberação manual (com pendências)",
             operatorId: req.user!.id,
@@ -516,6 +517,7 @@ router.post(
           log = await prisma.accessLog.update({
             where: { id: recentDenied.id },
             data: {
+              direction,
               result: AccessResult.GRANTED,
               reason: "Liberação manual (com pendências)",
               operatorId: req.user!.id,

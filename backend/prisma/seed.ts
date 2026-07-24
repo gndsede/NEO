@@ -57,7 +57,7 @@ async function main() {
   ];
   const admin = await prisma.user.upsert({
     where: { email: "admin@accesshub.dev" },
-    update: { profile: "USER", permissions: allPermissions },
+    update: { profile: "USER", permissions: allPermissions, allObrasAccess: true },
     create: {
       companyId: company.id,
       name: "Administrador",
@@ -65,6 +65,7 @@ async function main() {
       passwordHash,
       profile: "USER",
       permissions: allPermissions,
+      allObrasAccess: true,
     },
   });
 

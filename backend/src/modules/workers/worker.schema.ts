@@ -2,6 +2,7 @@ import { z } from "zod";
 import {
   DocumentType,
   EffectiveRequirementStatus,
+  LaborType,
   RequirementCollectionStatus,
   RequirementFrequency,
   WorkerStatus,
@@ -78,6 +79,8 @@ export const createWorkerSchema = z.object({
   admissionDate: dateLike,
   shiftStart: shiftTimeLike,
   shiftEnd: shiftTimeLike,
+  /// Classificação da mão de obra nesta obra: direta ou indireta.
+  laborType: z.nativeEnum(LaborType).optional(),
   documentsMeta: z
     .string()
     .optional()
@@ -128,6 +131,7 @@ export const createAssignmentSchema = z.object({
   admissionDate: dateLike,
   shiftStart: shiftTimeLike,
   shiftEnd: shiftTimeLike,
+  laborType: z.nativeEnum(LaborType).optional(),
 });
 
 export type CreateAssignmentInput = z.infer<typeof createAssignmentSchema>;
@@ -141,6 +145,7 @@ export const updateAssignmentSchema = z.object({
   admissionDate: dateLike,
   shiftStart: shiftTimeLike,
   shiftEnd: shiftTimeLike,
+  laborType: z.nativeEnum(LaborType).optional(),
   status: z.nativeEnum(WorkerStatus).optional(),
 });
 

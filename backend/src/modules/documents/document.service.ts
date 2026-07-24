@@ -108,6 +108,29 @@ export class DocumentService {
     return doc;
   }
 
+  /**
+   * Drivers S3/Supabase gravam `fileUrl` como URL pública crua do bucket —
+   * se o bucket for privado, o navegador recebe 403 ao tentar abrir o
+   * documento. O driver local já tem suas URLs assinadas por middleware
+   * (app.ts), então aqui só reescrevemos para s3/supabase.
+   */
+  private async withViewUrl<T extends { fileUrl: string; fileKey: string | null }>(
+    doc: T,
+  ): Promise<T> {
+    if (!doc.fileKey) return doc;
+    const storage = await getStorage();
+    if (storage.name === "local" || !storage.getSignedUrl) return doc;
+    return { ...doc, fileUrl: await storage.getSignedUrl(doc.fileKey) };
+  }
+
+  private async withViewUrls<T extends { fileUrl: string; fileKey: string | null }>(
+    docs: T[],
+  ): Promise<T[]> {
+    const storage = await getStorage();
+    if (storage.name === "local" || !storage.getSignedUrl) return docs;
+    return Promise.all(docs.map((doc) => this.withViewUrl(doc)));
+  }
+
   async list(scope: AuthScope, query: ListDocumentsQuery) {
     const where: Prisma.DocumentWhereInput = {
       companyId: scope.companyId,
@@ -123,26 +146,64 @@ export class DocumentService {
       ...(query.contractorId ? { contractorId: query.contractorId } : {}),
       ...(query.status ? { status: query.status } : {}),
       ...(query.type ? { type: query.type } : {}),
+      ...(scope.allowedDocumentTypes
+        ? { AND: [{ type: { in: scope.allowedDocumentTypes } }] }
+        : {}),
     };
+
+    const include = {
+      reviewedBy: { select: { id: true, name: true, email: true } },
+      uploadedBy: { select: { id: true, name: true, email: true } },
+      worker: { select: { id: true, fullName: true } },
+      contractor: { select: { id: true, name: true } },
+    };
+    const orderBy: Prisma.DocumentOrderByWithRelationInput[] = [
+      { status: "asc" },
+      { createdAt: "desc" },
+    ];
+
+    if (query.status === DocumentStatus.PENDENTE) {
+      // Reenvios antes da revisão criam mais de um Document PENDENTE para o
+      // mesmo item de exigência. Deduplicamos aqui (mantendo o mais recente)
+      // para que a lista bata com a contagem de itens realmente pendentes.
+      const all = await prisma.document.findMany({ where, include, orderBy });
+      const seen = new Set<string>();
+      const deduped = all.filter((doc) => {
+        const key =
+          doc.workerRequirementItemId ?? doc.contractorRequirementItemId ?? doc.id;
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      });
+      const total = deduped.length;
+      const items = deduped.slice(
+        (query.page - 1) * query.pageSize,
+        query.page * query.pageSize,
+      );
+      return {
+        items: await this.withViewUrls(items),
+        pagination: {
+          page: query.page,
+          pageSize: query.pageSize,
+          total,
+          totalPages: Math.ceil(total / query.pageSize),
+        },
+      };
+    }
 
     const [total, items] = await Promise.all([
       prisma.document.count({ where }),
       prisma.document.findMany({
         where,
-        include: {
-          reviewedBy: { select: { id: true, name: true, email: true } },
-          uploadedBy: { select: { id: true, name: true, email: true } },
-          worker: { select: { id: true, fullName: true } },
-          contractor: { select: { id: true, name: true } },
-        },
-        orderBy: [{ status: "asc" }, { createdAt: "desc" }],
+        include,
+        orderBy,
         skip: (query.page - 1) * query.pageSize,
         take: query.pageSize,
       }),
     ]);
 
     return {
-      items,
+      items: await this.withViewUrls(items),
       pagination: {
         page: query.page,
         pageSize: query.pageSize,
@@ -162,6 +223,9 @@ export class DocumentService {
           { contractor: contractorScopeWhere(scope) },
           { AND: [{ workerId: null }, { contractorId: null }] },
         ],
+        ...(scope.allowedDocumentTypes
+          ? { type: { in: scope.allowedDocumentTypes } }
+          : {}),
       },
       include: {
         reviewedBy: { select: { id: true, name: true, email: true } },
@@ -171,7 +235,7 @@ export class DocumentService {
       },
     });
     if (!doc) throw NotFound("Documento não encontrado");
-    return doc;
+    return this.withViewUrl(doc);
   }
 
   /**
@@ -321,6 +385,11 @@ export class DocumentService {
         if (!item) {
           throw NotFound("Exigência do colaborador não encontrada");
         }
+        if (item.status === RequirementCollectionStatus.PENDING_APPROVAL) {
+          throw BadRequest(
+            "Já existe um documento aguardando avaliação para esta exigência. Aguarde a revisão antes de reenviar.",
+          );
+        }
       }
     } else {
       const c = await prisma.contractor.findFirst({
@@ -339,6 +408,11 @@ export class DocumentService {
         });
         if (!item) {
           throw NotFound("Exigência do fornecedor não encontrada");
+        }
+        if (item.status === RequirementCollectionStatus.PENDING_APPROVAL) {
+          throw BadRequest(
+            "Já existe um documento aguardando avaliação para esta exigência. Aguarde a revisão antes de reenviar.",
+          );
         }
       }
     }

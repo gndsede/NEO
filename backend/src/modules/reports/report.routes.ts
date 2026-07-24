@@ -58,8 +58,8 @@ router.get(
       contractorsCount,
       topWorkerReqGroups,
       topContractorReqGroups,
-      pendingWorkerDocuments,
-      pendingContractorDocuments,
+      pendingWorkerDocs,
+      pendingContractorDocs,
     ] = await Promise.all([
       prisma.workerRequirementItem.groupBy({
         by: ["status"],
@@ -108,23 +108,36 @@ router.get(
         take: 5,
       }),
       // Documentos aguardando avaliação — fonte de verdade alinhada com /documentos/pendentes.
-      prisma.document.count({
+      // Selecionamos só o vínculo com a exigência para deduplicar em memória:
+      // reenvios antes da revisão geram mais de um Document PENDENTE para o
+      // mesmo item, e cada item só deve contar 1 vez (documentos avulsos,
+      // sem item vinculado, continuam contando cada um individualmente).
+      prisma.document.findMany({
         where: {
           companyId: companyIdValue,
           status: DocumentStatus.PENDENTE,
           ownerType: "WORKER",
           worker: workerScope,
         },
+        select: { id: true, workerRequirementItemId: true },
       }),
-      prisma.document.count({
+      prisma.document.findMany({
         where: {
           companyId: companyIdValue,
           status: DocumentStatus.PENDENTE,
           ownerType: "CONTRACTOR",
           contractor: contractorScope,
         },
+        select: { id: true, contractorRequirementItemId: true },
       }),
     ]);
+
+    const countDistinctPending = (
+      docs: Array<{ id: string; workerRequirementItemId?: string | null; contractorRequirementItemId?: string | null }>,
+    ) =>
+      new Set(
+        docs.map((d) => d.workerRequirementItemId ?? d.contractorRequirementItemId ?? d.id),
+      ).size;
 
     const workerStatus = workerStatusGroups.reduce((acc, g) => {
       acc[g.status] = (acc[g.status] ?? 0) + g._count._all;
@@ -137,8 +150,8 @@ router.get(
     }, emptyStatus());
 
     // "Aguardando avaliação" reflete documentos PENDENTE (não só exigências vinculadas).
-    workerStatus.PENDING_APPROVAL = pendingWorkerDocuments;
-    contractorStatus.PENDING_APPROVAL = pendingContractorDocuments;
+    workerStatus.PENDING_APPROVAL = countDistinctPending(pendingWorkerDocs);
+    contractorStatus.PENDING_APPROVAL = countDistinctPending(pendingContractorDocs);
 
     const totals = emptyStatus();
     for (const key of Object.keys(totals)) {

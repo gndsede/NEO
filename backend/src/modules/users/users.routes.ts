@@ -1,3 +1,4 @@
+import { randomBytes } from "node:crypto";
 import { Router, type Request } from "express";
 import { z } from "zod";
 import { Prisma, UserProfile } from "@prisma/client";
@@ -11,12 +12,15 @@ import {
   normalizePermissions,
   type PermissionKey,
 } from "../../lib/permissions.js";
-import { hasCapability } from "../../lib/permissions.js";
 import { hashPassword } from "../../lib/password.js";
+import { sendUserInviteEmail } from "../../lib/invite-email.js";
+import { env } from "../../config/env.js";
 import { auditContext, recordAudit } from "../../lib/audit.js";
 
 const router = Router();
 router.use(authenticate);
+
+const INVITE_TOKEN_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 dias
 
 function companyId(req: Request): string {
   if (!req.user) throw Unauthorized();
@@ -28,10 +32,16 @@ const permissionsSchema = z.array(z.string()).optional();
 const createSchema = z.object({
   name: z.string().trim().min(2),
   email: z.string().trim().email(),
-  password: z.string().min(8, "Senha deve ter ao menos 8 caracteres"),
+  // Sem senha: o usuário recebe um convite por e-mail para defini-la (fluxo
+  // padrão). Uma senha só é aceita aqui para os poucos casos em que o admin
+  // precisa definir o acesso na hora (ex.: sem e-mail configurado no tenant).
+  password: z.string().min(8, "Senha deve ter ao menos 8 caracteres").optional(),
   profile: z.nativeEnum(UserProfile).default(UserProfile.USER),
   contractorId: z.string().optional(),
   obraIds: z.array(z.string().min(1)).optional(),
+  /// Se true, o usuário enxerga todas as obras automaticamente (inclusive
+  /// futuras), independente da permissão obras.manage.
+  allObrasAccess: z.coerce.boolean().optional(),
   permissions: permissionsSchema,
   active: z.coerce.boolean().optional(),
 });
@@ -42,6 +52,7 @@ const updateSchema = z.object({
   profile: z.nativeEnum(UserProfile).optional(),
   contractorId: z.string().nullable().optional(),
   obraIds: z.array(z.string().min(1)).optional(),
+  allObrasAccess: z.coerce.boolean().optional(),
   permissions: permissionsSchema,
   active: z.coerce.boolean().optional(),
 });
@@ -61,6 +72,7 @@ async function publicUser(u: {
   contractorId: string | null;
   permissions: unknown;
   active: boolean;
+  allObrasAccess: boolean;
   createdAt: Date;
 }) {
   const obraAccess = await prisma.userObraAccess.findMany({
@@ -75,6 +87,7 @@ async function publicUser(u: {
     contractorId: u.contractorId,
     obraIds: obraAccess.map((a) => a.obraId),
     obras: obraAccess.map((a) => a.obra),
+    allObrasAccess: u.allObrasAccess,
     active: u.active,
     permissions: normalizePermissions(u.permissions),
     createdAt: u.createdAt,
@@ -85,9 +98,9 @@ async function syncUserObraAccess(
   userId: string,
   companyId: string,
   obraIds: string[] | undefined,
-  permissions: PermissionKey[],
+  allObrasAccess: boolean,
 ) {
-  if (hasCapability({ permissions }, "obras.manage") || !obraIds) return;
+  if (allObrasAccess || !obraIds) return;
   const valid = await prisma.obra.findMany({
     where: { companyId, id: { in: obraIds }, active: true },
     select: { id: true },
@@ -156,12 +169,23 @@ router.post(
       if (!contractor) throw BadRequest("Fornecedor não encontrado.");
     }
 
-    const passwordHash = await hashPassword(data.password);
     if (data.profile === "COLLABORATOR" && !data.contractorId) {
       throw BadRequest("Colaborador deve estar vinculado a uma empreiteira.");
     }
 
+    // Sem senha informada: fluxo padrão de convite por e-mail (o usuário
+    // define a própria senha). Com senha: admin define o acesso na hora.
+    const sendInvite = !data.password;
+    const inviteToken = sendInvite ? randomBytes(32).toString("hex") : null;
+    const inviteTokenExpiresAt = sendInvite
+      ? new Date(Date.now() + INVITE_TOKEN_TTL_MS)
+      : null;
+    const passwordHash = await hashPassword(
+      data.password ?? randomBytes(32).toString("hex"),
+    );
+
     const permissions = sanitizePermissions(data.permissions);
+    const allObrasAccess = data.allObrasAccess ?? false;
 
     const created = await prisma.user.create({
       data: {
@@ -171,8 +195,11 @@ router.post(
         passwordHash,
         profile: data.profile,
         contractorId: data.contractorId ?? null,
-        active: data.active ?? true,
+        active: sendInvite ? false : (data.active ?? true),
+        allObrasAccess,
         permissions: permissions as unknown as Prisma.InputJsonValue,
+        inviteToken,
+        inviteTokenExpiresAt,
       },
     });
 
@@ -190,18 +217,40 @@ router.post(
       created.id,
       companyId(req),
       obraIds,
-      permissions,
+      allObrasAccess,
     );
+
+    let inviteSent: boolean | undefined;
+    let inviteUrl: string | undefined;
+    if (sendInvite && inviteToken) {
+      const company = await prisma.company.findUnique({
+        where: { id: companyId(req) },
+        select: { name: true },
+      });
+      inviteSent = await sendUserInviteEmail({
+        recipientEmail: email,
+        recipientName: data.name,
+        companyName: company?.name ?? "",
+        inviteToken,
+      });
+      // Sempre devolvemos o link — o e-mail é só uma conveniência; se falhar
+      // (Resend não configurado, domínio não verificado etc.), o admin ainda
+      // consegue copiar e enviar manualmente.
+      inviteUrl = `${env.FRONTEND_URL.replace(/\/$/, "")}/aceitar-convite?token=${encodeURIComponent(inviteToken)}`;
+    }
 
     await recordAudit({
       ...auditContext(req),
       action: "USER_CREATED",
       entityType: "user",
       entityId: created.id,
-      meta: { email, profile: data.profile, permissions },
+      meta: { email, profile: data.profile, permissions, invited: sendInvite },
     });
 
-    res.status(201).json(await publicUser(created));
+    res.status(201).json({
+      ...(await publicUser(created)),
+      ...(sendInvite ? { inviteSent, inviteUrl } : {}),
+    });
   }),
 );
 
@@ -236,6 +285,8 @@ router.patch(
       data.permissions !== undefined
         ? sanitizePermissions(data.permissions)
         : normalizePermissions(existing.permissions);
+    const nextAllObrasAccess =
+      data.allObrasAccess !== undefined ? data.allObrasAccess : existing.allObrasAccess;
 
     const updated = await prisma.user.update({
       where: { id },
@@ -244,6 +295,7 @@ router.patch(
         ...(data.profile !== undefined ? { profile: data.profile } : {}),
         ...(data.active !== undefined ? { active: data.active } : {}),
         ...("contractorId" in data ? { contractorId: data.contractorId ?? null } : {}),
+        ...(data.allObrasAccess !== undefined ? { allObrasAccess: data.allObrasAccess } : {}),
         ...(data.permissions !== undefined
           ? {
               permissions: nextPermissions as unknown as Prisma.InputJsonValue,
@@ -260,7 +312,7 @@ router.patch(
         updated.id,
         companyId(req),
         data.obraIds,
-        nextPermissions,
+        nextAllObrasAccess,
       );
     }
 

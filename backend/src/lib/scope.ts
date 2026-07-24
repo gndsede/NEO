@@ -1,8 +1,8 @@
-import type { Prisma, UserProfile } from "@prisma/client";
+import type { DocumentType, Prisma, UserProfile } from "@prisma/client";
 import type { Request } from "express";
 import { prisma } from "./prisma.js";
 import { Forbidden } from "./errors.js";
-import { hasCapability, type PermissionList } from "./permissions.js";
+import type { PermissionList } from "./permissions.js";
 
 export const OBRA_HEADER = "x-obra-id";
 
@@ -15,14 +15,49 @@ export interface AuthScope {
   contractorId: string | null;
   obraIds: string[];
   activeObraId: string | null;
+  /// Se true, o usuário enxerga todas as obras do tenant automaticamente
+  /// (independente da permissão obras.manage, que só rege o CRUD de obras).
+  allObrasAccess: boolean;
+  /// Tipos de documento (SAFETY/STANDARD) que o usuário pode visualizar,
+  /// derivado dos grupos (UserGroup) aos quais pertence. `null` = sem
+  /// restrição (vê todos os tipos) — padrão para usuários fora de grupos
+  /// restritivos.
+  allowedDocumentTypes: DocumentType[] | null;
+}
+
+/**
+ * Calcula os tipos de documento visíveis para o usuário a partir dos grupos
+ * (UserGroup) aos quais pertence. Um grupo com `visibleDocumentTypes` vazio
+ * concede acesso irrestrito; a presença de QUALQUER grupo assim (ou a
+ * ausência de grupos) já torna o usuário irrestrito (união permissiva).
+ * Só restringe quando TODOS os grupos do usuário definem uma lista restrita.
+ */
+export async function loadAllowedDocumentTypesForUser(params: {
+  userId: string;
+  companyId: string;
+}): Promise<DocumentType[] | null> {
+  const memberships = await prisma.userGroupMember.findMany({
+    where: { userId: params.userId, group: { companyId: params.companyId, active: true } },
+    select: { group: { select: { visibleDocumentTypes: true } } },
+  });
+
+  if (memberships.length === 0) return null;
+
+  const restricted = new Set<DocumentType>();
+  for (const { group } of memberships) {
+    if (group.visibleDocumentTypes.length === 0) return null;
+    for (const t of group.visibleDocumentTypes) restricted.add(t);
+  }
+  return [...restricted];
 }
 
 export async function loadObraIdsForUser(params: {
   userId: string;
   companyId: string;
   permissions: PermissionList;
+  allObrasAccess: boolean;
 }): Promise<string[]> {
-  if (hasCapability({ permissions: params.permissions }, "obras.manage")) {
+  if (params.allObrasAccess) {
     const obras = await prisma.obra.findMany({
       where: { companyId: params.companyId, active: true },
       select: { id: true },

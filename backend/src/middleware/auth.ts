@@ -12,6 +12,7 @@ import {
   type PermissionList,
 } from "../lib/permissions.js";
 import {
+  loadAllowedDocumentTypesForUser,
   loadObraIdsForUser,
   resolveActiveObraId,
   type AuthScope,
@@ -71,6 +72,7 @@ async function buildAuthUser(
     where: { id: decoded.sub, companyId: decoded.companyId },
     select: {
       active: true,
+      allObrasAccess: true,
       company: { select: { blocked: true, licenseExpiresAt: true } },
     },
   });
@@ -92,17 +94,23 @@ async function buildAuthUser(
     userId: decoded.sub,
     companyId: decoded.companyId,
     permissions,
+    allObrasAccess: account.allObrasAccess,
   });
 
   // Gestores de obra podem acessar o sistema mesmo sem obras ativas (ex.: cadastrar a primeira).
   if (
     obraIds.length === 0 &&
-    !hasCapability({ permissions }, "obras.manage")
+    !hasCapability({ permissions }, "obras.manage") &&
+    !account.allObrasAccess
   ) {
     throw Forbidden("Nenhuma obra liberada para este usuário.");
   }
 
   const activeObraId = resolveActiveObraId(req, obraIds);
+  const allowedDocumentTypes = await loadAllowedDocumentTypesForUser({
+    userId: decoded.sub,
+    companyId: decoded.companyId,
+  });
 
   return {
     id: decoded.sub,
@@ -113,6 +121,8 @@ async function buildAuthUser(
     contractorId: decoded.contractorId ?? null,
     obraIds,
     activeObraId,
+    allObrasAccess: account.allObrasAccess,
+    allowedDocumentTypes,
   };
 }
 

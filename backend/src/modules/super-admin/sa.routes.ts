@@ -486,6 +486,10 @@ router.post(
           passwordHash: placeholderPasswordHash,
           profile: "USER",
           permissions: fullPermissions(),
+          // Dono/primeiro usuário do tenant: precisa enxergar todas as obras
+          // desde já, mesmo antes de qualquer uma existir (allObrasAccess é
+          // independente da permissão obras.manage — ver lib/scope.ts).
+          allObrasAccess: true,
           active: false,
           inviteToken,
           inviteTokenExpiresAt,

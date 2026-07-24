@@ -49,8 +49,21 @@ router.get(
 
     const baseWhere = { companyId: company, obraId };
 
+    // Além do updatedAt do próprio vínculo, precisamos capturar mudanças que
+    // afetam a liberação de acesso mas não tocam o WorkerAssignment: uma
+    // exigência pode virar pendente (ex.: admin adiciona documento obrigatório
+    // à função) via WorkerRequirementItem, e um documento pode ser rejeitado,
+    // sem que nenhuma dessas ações atualize o vínculo. Sem isso, o cache do
+    // app da catraca nunca aprende sobre a pendência e libera indevidamente.
     const upsertsWhere = since
-      ? { ...baseWhere, updatedAt: { gte: since } }
+      ? {
+          ...baseWhere,
+          OR: [
+            { updatedAt: { gte: since } },
+            { requirementItems: { some: { updatedAt: { gte: since } } } },
+            { worker: { documents: { some: { updatedAt: { gte: since } } } } },
+          ],
+        }
       : { ...baseWhere, status: { not: WorkerStatus.INACTIVE } };
 
     const assignments = await prisma.workerAssignment.findMany({

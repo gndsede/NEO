@@ -454,6 +454,7 @@ export class WorkerService {
           admissionDate: data.admissionDate,
           shiftStart: data.shiftStart,
           shiftEnd: data.shiftEnd,
+          laborType: data.laborType,
         },
       });
 
@@ -568,6 +569,7 @@ export class WorkerService {
           admissionDate: data.admissionDate,
           shiftStart: data.shiftStart,
           shiftEnd: data.shiftEnd,
+          laborType: data.laborType,
         },
         include: {
           obra: { select: { id: true, name: true } },
@@ -928,6 +930,7 @@ export class WorkerService {
           ...(data.admissionDate !== undefined ? { admissionDate: data.admissionDate } : {}),
           ...(data.shiftStart !== undefined ? { shiftStart: data.shiftStart } : {}),
           ...(data.shiftEnd !== undefined ? { shiftEnd: data.shiftEnd } : {}),
+          ...(data.laborType !== undefined ? { laborType: data.laborType } : {}),
           ...(data.status !== undefined ? { status: data.status } : {}),
         },
         include: {
@@ -980,6 +983,9 @@ export class WorkerService {
       where: {
         companyId: scope.companyId,
         assignment: assignmentScope,
+        ...(scope.allowedDocumentTypes
+          ? { documentType: { in: scope.allowedDocumentTypes } }
+          : {}),
       },
       _count: { _all: true },
     });
@@ -1014,6 +1020,9 @@ export class WorkerService {
         : {}),
       ...(query.workerId ? { workerId: query.workerId } : {}),
       ...(query.assignmentId ? { assignmentId: query.assignmentId } : {}),
+      ...(scope.allowedDocumentTypes
+        ? { documentType: { in: scope.allowedDocumentTypes } }
+        : {}),
     };
 
     const [total, items] = await Promise.all([

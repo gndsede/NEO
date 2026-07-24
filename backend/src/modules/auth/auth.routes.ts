@@ -253,6 +253,7 @@ router.post(
       userId: user.id,
       companyId: user.companyId,
       permissions,
+      allObrasAccess: user.allObrasAccess,
     });
 
     const obras = await prisma.obra.findMany({
@@ -273,6 +274,9 @@ router.post(
         permissions,
         obraIds,
         activeObraId: obras[0]?.id ?? null,
+        allObrasAccess: user.allObrasAccess,
+        // Recalculado a cada requisição em buildAuthUser; não faz parte do JWT.
+        allowedDocumentTypes: null,
       },
       { expiresIn: env.JWT_EXPIRES_IN_WEB },
     );
@@ -676,6 +680,7 @@ router.post(
       userId: user.id,
       companyId: user.companyId,
       permissions,
+      allObrasAccess: user.allObrasAccess,
     });
 
     const obras = await prisma.obra.findMany({
@@ -693,6 +698,8 @@ router.post(
       permissions,
       obraIds,
       activeObraId: obras[0]?.id ?? null,
+      allObrasAccess: user.allObrasAccess,
+      allowedDocumentTypes: null,
     });
 
     await recordAudit({

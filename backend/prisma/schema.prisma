@@ -30,6 +30,13 @@ enum WorkerStatus {
   BLOCKED // Bloqueado (ex.: documentação irregular)
 }
 
+/// Classificação da mão de obra do colaborador nesta obra: direta (contratada
+/// pela própria contratante) ou indireta (via empreiteira/terceiro).
+enum LaborType {
+  DIRETA
+  INDIRETA
+}
+
 /// A quem o documento pertence (tabela polimórfica).
 enum DocumentOwnerType {
   WORKER
@@ -199,6 +206,10 @@ model User {
   contractor   Contractor? @relation("UserContractor", fields: [contractorId], references: [id], onDelete: SetNull)
   /// Lista de permissões (chaves de ação) concedidas ao usuário.
   permissions  Json?
+  /// Se true, o usuário enxerga todas as obras do tenant automaticamente
+  /// (inclusive obras futuras), independente da lista em UserObraAccess.
+  /// Independente da permissão "obras.manage" (que só rege o CRUD de obras).
+  allObrasAccess Boolean @default(false)
   active       Boolean  @default(true)
   /// Segredo TOTP (base32) para autenticação de dois fatores via Google Authenticator.
   totpSecret   String?
@@ -381,6 +392,8 @@ model WorkerAssignment {
   admissionDate DateTime?
   shiftStart   String?
   shiftEnd     String?
+  /// Mão de obra direta (contratada pela contratante) ou indireta (empreiteira/terceiro).
+  laborType    LaborType    @default(DIRETA)
   status       WorkerStatus @default(ACTIVE)
   /// Validade do acesso nesta obra (derivada dos requisitos; cacheável).
   accessValidUntil DateTime?
@@ -452,6 +465,9 @@ model UserGroup {
   name        String
   description String?
   active      Boolean  @default(true)
+  /// Tipos de documento (Segurança/Padrão) que membros deste grupo podem
+  /// visualizar. Lista vazia = sem restrição (vê todos os tipos).
+  visibleDocumentTypes DocumentType[] @default([])
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
 

@@ -1,5 +1,6 @@
 import { Router, type Request } from "express";
 import { z } from "zod";
+import { DocumentType } from "@prisma/client";
 import { prisma } from "../../lib/prisma.js";
 import { asyncHandler } from "../../middleware/async-handler.js";
 import { authenticate, requireCapability } from "../../middleware/auth.js";
@@ -18,6 +19,9 @@ const upsertSchema = z.object({
   description: z.string().trim().optional(),
   active: z.coerce.boolean().optional(),
   memberIds: z.array(z.string().min(1)).optional(),
+  /// Tipos de documento (SAFETY/STANDARD) que membros deste grupo podem
+  /// visualizar. Vazio/omitido = sem restrição (vê todos os tipos).
+  visibleDocumentTypes: z.array(z.nativeEnum(DocumentType)).optional(),
 });
 
 async function withMembers(group: { id: string }) {
@@ -84,6 +88,7 @@ router.post(
         name: data.name,
         description: data.description,
         active: data.active ?? true,
+        visibleDocumentTypes: data.visibleDocumentTypes ?? [],
       },
     });
 
@@ -115,6 +120,9 @@ router.patch(
         ...(data.name !== undefined ? { name: data.name } : {}),
         ...(data.description !== undefined ? { description: data.description } : {}),
         ...(data.active !== undefined ? { active: data.active } : {}),
+        ...(data.visibleDocumentTypes !== undefined
+          ? { visibleDocumentTypes: data.visibleDocumentTypes }
+          : {}),
       },
     });
 
