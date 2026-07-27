@@ -1,10 +1,22 @@
 import { Resend } from "resend";
 import { env } from "../config/env.js";
+import { logger } from "./logger.js";
 
 let _resend: Resend | null = null;
+let warnedMissingKey = false;
 
 function getResend(): Resend | null {
-  if (!env.RESEND_API_KEY) return null;
+  if (!env.RESEND_API_KEY) {
+    // Loga uma única vez por processo — sem isso, a ausência da chave em
+    // produção fica invisível (o endpoint sempre responde 200 genérico).
+    if (!warnedMissingKey) {
+      warnedMissingKey = true;
+      logger.warn(
+        "[password-reset-email] RESEND_API_KEY não configurada — e-mail de redefinição não será enviado",
+      );
+    }
+    return null;
+  }
   if (!_resend) _resend = new Resend(env.RESEND_API_KEY);
   return _resend;
 }
@@ -100,8 +112,7 @@ export async function sendPasswordResetEmail(params: {
   });
 
   if (error) {
-    // eslint-disable-next-line no-console
-    console.error("[password-reset-email] falha ao enviar e-mail:", error);
+    logger.error("[password-reset-email] falha ao enviar e-mail", { err: error });
     return false;
   }
 
