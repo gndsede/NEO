@@ -1,7 +1,6 @@
 [submodule "app-catraca"]
 	path = app-catraca
-	url = https://github.com/IuriD7/app-catraca.git
-
-[submodule "ingress-craftsman"]
-	path = ingress-craftsman
-	url = https://github.com/IuriD7/ingress-craftsman.git
+	url = https://github.com/gndsede/app-catraca.git
+[submodule "frontend"]
+	path = frontend
+	url = https://github.com/gndsede/neo-frontend.git

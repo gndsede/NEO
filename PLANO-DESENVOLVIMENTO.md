@@ -44,7 +44,7 @@
 - Validação de pertença à obra ativa no scan
 - Cron scheduler para EXIT automático 8h após ENTRY órfã
 
-### Web Admin (`ingress-craftsman/`)
+### Web Admin (`frontend/`)
 **Stack:** TanStack Start + React 19 + shadcn/ui + Tailwind + React Query + React Hook Form + Zod
 
 **Estado:** Funcional para cadastros principais. Gerado parcialmente via Lovable.dev.
