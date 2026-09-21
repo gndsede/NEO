@@ -50,6 +50,13 @@ export function createApp() {
         callback(null, allowedOrigins.includes(origin));
       },
       credentials: true,
+      // Downloads binários (crachás, relatórios) carregam o nome do arquivo e
+      // o resumo do lote em cabeçalhos — sem expor, o browser os esconde.
+      exposedHeaders: [
+        "Content-Disposition",
+        "X-Crachas-Gerados",
+        "X-Crachas-Falhas",
+      ],
     }),
   );
   app.use(express.json({ limit: "2mb" }));

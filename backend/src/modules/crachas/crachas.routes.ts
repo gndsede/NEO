@@ -66,14 +66,18 @@ router.post(
         return;
       }
     }
-    const pdfBuf = await crachasService.gerarLote(
+    const { pdf, gerados, falhas } = await crachasService.gerarLote(
       template.buffer,
       req.user,
       workerIds,
     );
     res.setHeader("Content-Type", "application/pdf");
     res.setHeader("Content-Disposition", 'attachment; filename="CRACHAS_LOTE.pdf"');
-    res.send(pdfBuf);
+    // O corpo é binário: o resumo do lote vai em cabeçalhos (expostos no CORS)
+    // para o front avisar quando alguém ficou de fora.
+    res.setHeader("X-Crachas-Gerados", String(gerados));
+    res.setHeader("X-Crachas-Falhas", String(falhas.length));
+    res.send(pdf);
   }),
 );
 

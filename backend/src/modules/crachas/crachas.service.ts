@@ -1,10 +1,17 @@
 import path from "node:path";
 import PDFDocument from "pdfkit";
 import QRCode from "qrcode";
-import sharp from "sharp";
+import sharp, { type OverlayOptions } from "sharp";
+import { WorkerStatus, type Prisma } from "@prisma/client";
 import { prisma } from "../../lib/prisma.js";
+import { BadRequest } from "../../lib/errors.js";
+import { logger } from "../../lib/logger.js";
 import { signLocalFileUrl } from "../../lib/file-signing.js";
-import { workerScopeWhere, type AuthScope } from "../../lib/scope.js";
+import {
+  assignmentScopeWhere,
+  workerScopeWhere,
+  type AuthScope,
+} from "../../lib/scope.js";
 import { badgeService } from "../badge/badge.service.js";
 
 // Badge: 57×89 mm → pontos PDF (1 pt = 1/72 pol)
@@ -105,21 +112,26 @@ async function prepararFoto(fotoBuf: Buffer): Promise<Buffer> {
     .toBuffer();
 }
 
-async function compositar(
-  templateBuf: Buffer,
-  qrBuf: Buffer,
-  fotoBuf?: Buffer,
-): Promise<Buffer> {
-  // Normaliza o template para o canvas de referência (sRGB, fundo branco) —
-  // garante que as posições batem e preserva as cores (sem JPEG/CMYK).
-  const tpl = await sharp(templateBuf)
+/**
+ * Normaliza o template para o canvas de referência (sRGB, fundo branco) —
+ * garante que as posições batem e preserva as cores (sem JPEG/CMYK).
+ * Custa um decode/resize por chamada: no lote é feito uma única vez.
+ */
+async function normalizarTemplate(templateBuf: Buffer): Promise<Buffer> {
+  return sharp(templateBuf)
     .resize(CANVAS_W, CANVAS_H, { fit: "fill" })
     .flatten({ background: "#FFFFFF" })
     .toColourspace("srgb")
     .png()
     .toBuffer();
+}
 
-  const composites: sharp.OverlayOptions[] = [];
+async function compositar(
+  tpl: Buffer,
+  qrBuf: Buffer,
+  fotoBuf?: Buffer,
+): Promise<Buffer> {
+  const composites: OverlayOptions[] = [];
 
   if (fotoBuf) {
     composites.push({
@@ -259,7 +271,11 @@ export async function gerarPorWorker(
     : undefined;
 
   const qrBuf = await gerarQrBuffer(payload.access.qrContent);
-  const imgBuf = await compositar(templateBuf, qrBuf, fotoBuf);
+  const imgBuf = await compositar(
+    await normalizarTemplate(templateBuf),
+    qrBuf,
+    fotoBuf,
+  );
 
   const doc = criarDoc();
   const done = pdfParaBuffer(doc);
@@ -274,47 +290,89 @@ export async function gerarPorWorker(
   return done;
 }
 
-/** Gera PDF em lote para todos (ou os selecionados) colaboradores ativos do escopo. */
+export interface ResultadoLote {
+  pdf: Buffer;
+  gerados: number;
+  /** Colaboradores que ficaram de fora, com o motivo (nome: motivo). */
+  falhas: string[];
+}
+
+/** Gera PDF em lote para todos (ou os selecionados) colaboradores do escopo. */
 export async function gerarLote(
   templateBuf: Buffer,
   scope: AuthScope,
   workerIds?: string[],
-): Promise<Buffer> {
-  const ids =
+): Promise<ResultadoLote> {
+  // `status` é campo de WorkerAssignment, não de Worker: filtrar no Worker
+  // gera PrismaClientValidationError (500). O vínculo ativo é verificado
+  // dentro de `assignments.some`.
+  // Com seleção explícita, respeita a escolha do usuário — limitando apenas
+  // ao escopo (obra/empreiteira), sem exigir vínculo ativo.
+  const where: Prisma.WorkerWhereInput =
     workerIds && workerIds.length > 0
-      ? workerIds
-      : (
-          await prisma.worker.findMany({
-            where: { ...workerScopeWhere(scope), status: "ACTIVE" },
-            select: { id: true },
-            orderBy: { fullName: "asc" },
-          })
-        ).map((w) => w.id);
+      ? { ...workerScopeWhere(scope), id: { in: workerIds } }
+      : {
+          companyId: scope.companyId,
+          assignments: {
+            some: { ...assignmentScopeWhere(scope), status: WorkerStatus.ACTIVE },
+          },
+        };
 
-  if (ids.length === 0) throw new Error("Nenhum colaborador ativo encontrado");
+  const alvos = await prisma.worker.findMany({
+    where,
+    select: { id: true, fullName: true },
+    orderBy: { fullName: "asc" },
+  });
+
+  if (alvos.length === 0) {
+    throw BadRequest(
+      workerIds && workerIds.length > 0
+        ? "Nenhum dos colaboradores selecionados está no seu escopo de acesso."
+        : "Nenhum colaborador com vínculo ativo encontrado nas suas obras.",
+    );
+  }
+
+  // Um único decode do template para todo o lote.
+  const tpl = await normalizarTemplate(templateBuf);
 
   const doc = criarDoc();
   const done = pdfParaBuffer(doc);
+  const falhas: string[] = [];
+  let gerados = 0;
 
-  for (const id of ids) {
+  for (const alvo of alvos) {
     try {
-      const payload = await badgeService.generate(scope, id);
+      const payload = await badgeService.generate(scope, alvo.id);
       const fotoBuf = payload.worker.photoUrl
         ? await baixarFoto(payload.worker.photoUrl)
         : undefined;
       const qrBuf = await gerarQrBuffer(payload.access.qrContent);
-      const imgBuf = await compositar(templateBuf, qrBuf, fotoBuf);
+      const imgBuf = await compositar(tpl, qrBuf, fotoBuf);
       adicionarPagina(doc, imgBuf, {
         nome: payload.worker.fullName,
         funcao: payload.worker.functionName ?? payload.worker.role,
         matricula: payload.worker.registration ?? "—",
         cpf: payload.worker.cpf,
       });
-    } catch {
-      // colaborador sem dados suficientes: pula sem travar o lote
+      gerados += 1;
+    } catch (err) {
+      // Um colaborador sem dados suficientes não derruba o lote — mas o
+      // motivo é registrado e devolvido, em vez de sumir num catch vazio.
+      const motivo = err instanceof Error ? err.message : String(err);
+      falhas.push(`${alvo.fullName}: ${motivo}`);
+      logger.warn("cracha_lote_item_falhou", { err, workerId: alvo.id });
     }
   }
 
   doc.end();
-  return done;
+  const pdf = await done;
+
+  if (gerados === 0) {
+    throw BadRequest(
+      `Nenhum crachá pôde ser gerado (${falhas.length} de ${alvos.length} falharam).`,
+      { falhas: falhas.slice(0, 20) },
+    );
+  }
+
+  return { pdf, gerados, falhas };
 }
