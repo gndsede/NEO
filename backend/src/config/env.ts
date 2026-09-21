@@ -8,6 +8,7 @@ import { z } from "zod";
  * Domínios customizados adicionais devem ser informados via `CORS_ORIGIN`.
  */
 const KNOWN_PRODUCTION_ORIGINS = [
+  "https://neo-frontend-psi.vercel.app",
   "https://neo-solucoes-civis.vercel.app",
 ];
 
@@ -109,6 +110,17 @@ const envSchema = z.object({
   // Atrás do load balancer (Railway) sem TRUST_PROXY, o rate limit enxerga um
   // único IP (o do proxy) e a proteção contra força bruta é neutralizada.
   // Railway/PaaS estão sempre atrás de proxy: default seguro = 1.
+  // FRONTEND_URL só é usada para montar links enviados por e-mail (convite de
+  // senha). Um default de localhost em produção gera link que ninguém abre.
+  if (process.env.FRONTEND_URL === undefined) {
+    next.FRONTEND_URL = KNOWN_PRODUCTION_ORIGINS[0];
+    // eslint-disable-next-line no-console
+    console.warn(
+      `⚠️  FRONTEND_URL não definida em produção — usando ${next.FRONTEND_URL}. ` +
+        "Defina-a no ambiente se o painel usar domínio customizado.",
+    );
+  }
+
   if (process.env.TRUST_PROXY === undefined) {
     next.TRUST_PROXY = 1;
     // eslint-disable-next-line no-console

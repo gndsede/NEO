@@ -1,0 +1,17 @@
+[
+  {
+    "email": "loadtest1@neosolucoescivis.com.br",
+    "password": "LoadTest#8b2cdd350812",
+    "totpSecret": "M7SZ33NVCW6J7E4XBCXNRG7STKRVC34O"
+  },
+  {
+    "email": "loadtest2@neosolucoescivis.com.br",
+    "password": "LoadTest#6a0eb77b9089",
+    "totpSecret": "TBKM4Z33XG5GOWIMTYLSSSB77D2CMYKX"
+  },
+  {
+    "email": "loadtest3@neosolucoescivis.com.br",
+    "password": "LoadTest#081b83c4ecf9",
+    "totpSecret": "5T6MCYHPJ5OJOYIXTHBF626UTKA53OLE"
+  }
+]

@@ -1,0 +1,12 @@
+[
+  {
+    "email": "loadtest1@neosolucoescivis.com.br",
+    "password": "TrocarSenh@Forte1",
+    "totpSecret": "JBSWY3DPEHPK3PXP"
+  },
+  {
+    "email": "loadtest2@neosolucoescivis.com.br",
+    "password": "TrocarSenh@Forte2",
+    "totpSecret": "JBSWY3DPEHPK3PXP"
+  }
+]

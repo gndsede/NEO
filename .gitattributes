@@ -1,0 +1,15 @@
+# Normaliza quebras de linha: arquivos de texto sempre com LF no repositório,
+# independente do core.autocrlf de cada máquina (evita diffs gigantes e
+# lint quebrado por CRLF em checkouts Windows).
+* text=auto eol=lf
+
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.pdf binary
+*.ttf binary
+*.woff binary
+*.woff2 binary
+*.eot binary
