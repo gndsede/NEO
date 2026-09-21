@@ -5,6 +5,7 @@ import {
   AccessResult,
   DocumentStatus,
   DocumentType,
+  LifecyclePhase,
   Prisma,
   RequirementCollectionStatus,
   WorkerStatus,
@@ -16,6 +17,14 @@ import { Unauthorized } from "../../lib/errors.js";
 import { resolveScannedToken } from "../../utils/access-hash.js";
 import { rewritePublicUrl } from "../../lib/public-url.js";
 import { resolveNextDirection } from "./access.direction.js";
+
+/**
+ * Quem ainda está em processo de entrada não entrou na obra: a documentação
+ * admissional é justamente o que autoriza o primeiro acesso. Já quem está em
+ * processo demissional continua trabalhando até ser inativado, então passa.
+ */
+const ENTRADA_DENY_REASON =
+  "Colaborador em processo de entrada — documentação admissional pendente";
 
 const NR_TITLE_PATTERN = /\bNR[\s-]?(10|18|35)\b/i;
 const ASO_TITLE_PATTERN = /\bASO\b/i;
@@ -64,6 +73,9 @@ async function fetchPendingRequirements(
       workerId,
       ...(assignmentId ? { assignmentId } : {}),
       status: { in: PENDING_REQUIREMENT_STATUSES },
+      // Documentação de saída é condição para INATIVAR, não para entrar: quem
+      // está cumprindo aviso continua trabalhando e precisa passar na catraca.
+      phase: { not: LifecyclePhase.SAIDA },
     },
     select: { id: true, name: true, documentType: true, status: true },
     orderBy: [{ status: "asc" }, { name: "asc" }],
@@ -198,7 +210,7 @@ router.post(
 
     // Verifica assignment na obra ativa da portaria
     const activeObraId = req.user!.activeObraId;
-    let assignment: { id: string; status: string; accessValidUntil: Date | null; role: string; registration: string | null; contractor: { id: string; name: string }; function: { id: string; name: string } | null; } | null = null;
+    let assignment: { id: string; status: string; phase: LifecyclePhase; accessValidUntil: Date | null; role: string; registration: string | null; contractor: { id: string; name: string }; function: { id: string; name: string } | null; } | null = null;
 
     if (activeObraId) {
       assignment = await prisma.workerAssignment.findUnique({
@@ -242,6 +254,8 @@ router.post(
       return deny("Colaborador bloqueado nesta obra", worker.id, direction);
     if (assignment.status === WorkerStatus.INACTIVE)
       return deny("Colaborador inativo nesta obra", worker.id, direction);
+    if (assignment.phase === LifecyclePhase.ENTRADA)
+      return deny(ENTRADA_DENY_REASON, worker.id, direction);
 
     // Verifica pendências scoped ao assignment desta obra
     const pendingRequirements = await fetchPendingRequirements(
@@ -453,12 +467,12 @@ router.post(
         (await resolveNextDirection({ companyId: company, workerId: worker.id }));
 
       // Busca assignment na obra desta portaria
-      let assignment: { id: string; status: string; accessValidUntil: Date | null } | null = null;
+      let assignment: { id: string; status: string; phase: LifecyclePhase; accessValidUntil: Date | null } | null = null;
 
       if (batchActiveObraId) {
         assignment = await prisma.workerAssignment.findUnique({
           where: { obraId_workerId: { obraId: batchActiveObraId, workerId: worker.id } },
-          select: { id: true, status: true, accessValidUntil: true },
+          select: { id: true, status: true, phase: true, accessValidUntil: true },
         });
 
         if (!assignment) {
@@ -468,7 +482,7 @@ router.post(
       } else {
         assignment = await prisma.workerAssignment.findFirst({
           where: { workerId: worker.id, companyId: company, status: WorkerStatus.ACTIVE },
-          select: { id: true, status: true, accessValidUntil: true },
+          select: { id: true, status: true, phase: true, accessValidUntil: true },
         });
       }
 
@@ -483,6 +497,10 @@ router.post(
       }
       if (assignment.status === WorkerStatus.INACTIVE) {
         await recordDeny("Colaborador inativo", direction, worker.id);
+        continue;
+      }
+      if (assignment.phase === LifecyclePhase.ENTRADA) {
+        await recordDeny(ENTRADA_DENY_REASON, direction, worker.id);
         continue;
       }
 

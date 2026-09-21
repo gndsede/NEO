@@ -2,6 +2,7 @@ import type { Request, Response } from "express";
 import { workerService } from "./worker.service.js";
 import {
   addManualWorkerRequirementSchema,
+  changeAssignmentPhaseSchema,
   createAssignmentSchema,
   createWorkerSchema,
   importWorkersSchema,
@@ -138,6 +139,52 @@ export const workerController = {
       data,
     );
     res.json(assignment);
+  },
+
+  /**
+   * GET /workers/:id/phase?assignmentId=...
+   * Placar do ciclo entrada → atividade → saída do vínculo.
+   */
+  async getPhase(req: Request, res: Response) {
+    const scope = scopeFromRequest(req);
+    const assignmentId = req.query.assignmentId
+      ? String(req.query.assignmentId)
+      : undefined;
+    const status = await workerService.getPhaseStatus(
+      scope,
+      String(req.params.id),
+      assignmentId,
+    );
+    res.json(status);
+  },
+
+  /**
+   * PATCH /workers/:id/assignments/:assignmentId/phase
+   * Liberar para atividade / abrir processo demissional.
+   */
+  async changePhase(req: Request, res: Response) {
+    const scope = scopeFromRequest(req);
+    const { phase } = changeAssignmentPhaseSchema.parse(req.body);
+    const workerId = String(req.params.id);
+    const assignmentId = String(req.params.assignmentId);
+
+    const result = await workerService.changePhase(
+      scope,
+      workerId,
+      assignmentId,
+      phase,
+      req.user?.id,
+    );
+
+    await recordAudit({
+      ...auditContext(req),
+      action: "WORKER_PHASE_CHANGED",
+      entityType: "worker_assignment",
+      entityId: assignmentId,
+      meta: { workerId, phase },
+    });
+
+    res.json(result);
   },
 
   /** GET /workers/requirements — lista todas as exigências (aba Pendentes) */

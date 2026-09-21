@@ -33,7 +33,8 @@ export type AuditAction =
   | "USER_PERMISSIONS_CHANGED"
   | "PASSWORD_RESET_REQUESTED"
   | "PASSWORD_RESET_COMPLETED"
-  | "WORKER_ANONYMIZED";
+  | "WORKER_ANONYMIZED"
+  | "WORKER_PHASE_CHANGED";
 
 export interface AuditEntry {
   action: AuditAction;

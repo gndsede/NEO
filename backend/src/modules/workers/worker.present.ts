@@ -32,6 +32,8 @@ type AssignmentLike = {
   shiftEnd?: string | null;
   laborType?: string;
   status?: string;
+  phase?: string;
+  phaseUpdatedAt?: Date | null;
   functionId?: string | null;
   contractor?: { id: string; name: string; cnpj?: string | null } | null;
   obra?: { id: string; name: string } | null;
@@ -43,6 +45,7 @@ type AssignmentLike = {
     effectiveStatus?: string;
     expiresAt?: Date | null;
     status?: string;
+    phase?: string;
     requirement?: { id: string; name: string; frequency: string } | null;
   }>;
 };
@@ -108,6 +111,8 @@ export function flattenWorker<T extends WorkerWithAssignments>(
     shiftEnd: assignment.shiftEnd ?? null,
     laborType: assignment.laborType,
     status: assignment.status,
+    phase: assignment.phase,
+    phaseUpdatedAt: assignment.phaseUpdatedAt ?? null,
     functionId: assignment.functionId ?? null,
     contractor: assignment.contractor ?? null,
     obra: assignment.obra ?? null,

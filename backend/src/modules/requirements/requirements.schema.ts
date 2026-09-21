@@ -2,6 +2,7 @@ import { z } from "zod";
 import {
   CompetenceMode,
   DocumentType,
+  LifecyclePhase,
   RequirementFrequency,
   RequirementTarget,
 } from "@prisma/client";
@@ -16,6 +17,29 @@ const dateLike = z
   })
   .transform((v) => (v ? new Date(v) : undefined));
 
+/**
+ * Fases em que o registro é cobrado. Aceita array (JSON) ou string separada por
+ * vírgula/;/| — o mesmo campo é usado pela importação de planilha.
+ */
+const phasesLike = z
+  .union([z.array(z.nativeEnum(LifecyclePhase)), z.string()])
+  .optional()
+  .transform((v) => {
+    if (v === undefined) return undefined;
+    if (Array.isArray(v)) return v;
+    const parsed = v
+      .split(/[,;|]/)
+      .map((s) => s.trim().toUpperCase())
+      .filter(Boolean);
+    return parsed as LifecyclePhase[];
+  })
+  .refine(
+    (v) =>
+      v === undefined ||
+      v.every((p) => Object.values(LifecyclePhase).includes(p)),
+    { message: "Fase inválida (use ENTRADA, ATIVIDADE ou SAIDA)" },
+  );
+
 export const requirementDefinitionUpsertSchema = z.object({
   target: z.nativeEnum(RequirementTarget),
   name: z.string().trim().min(2, "Nome do registro é obrigatório"),
@@ -24,6 +48,7 @@ export const requirementDefinitionUpsertSchema = z.object({
   frequency: z.nativeEnum(RequirementFrequency),
   monthlyDueDay: z.coerce.number().int().min(1).max(31).optional(),
   referenceDate: dateLike,
+  phases: phasesLike,
   attachmentFormats: z.string().trim().optional(),
   attachmentRequired: z.coerce.boolean().optional(),
   competenceMode: z.nativeEnum(CompetenceMode).optional(),
@@ -83,6 +108,7 @@ export const importDefinitionRowSchema = z.object({
   frequency: z.nativeEnum(RequirementFrequency).default(RequirementFrequency.ONE_TIME),
   monthlyDueDay: z.coerce.number().int().min(1).max(31).optional(),
   referenceDate: dateLike,
+  phases: phasesLike,
 });
 
 export type ImportNameDescRow = z.infer<typeof importNameDescRowSchema>;

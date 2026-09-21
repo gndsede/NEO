@@ -3,6 +3,7 @@ import {
   DocumentType,
   EffectiveRequirementStatus,
   LaborType,
+  LifecyclePhase,
   RequirementCollectionStatus,
   RequirementFrequency,
   WorkerStatus,
@@ -147,6 +148,8 @@ export const updateAssignmentSchema = z.object({
   shiftEnd: shiftTimeLike,
   laborType: z.nativeEnum(LaborType).optional(),
   status: z.nativeEnum(WorkerStatus).optional(),
+  /// Fase documental do vínculo. Transições passam pelas travas do processo.
+  phase: z.nativeEnum(LifecyclePhase).optional(),
 });
 
 export type UpdateAssignmentInput = z.infer<typeof updateAssignmentSchema>;
@@ -194,6 +197,8 @@ export const listWorkersQuerySchema = z.object({
     .transform((v) => (v === undefined ? undefined : v === "true")),
 
   status: z.enum(["ACTIVE", "INACTIVE", "BLOCKED"]).optional(),
+  /// Filtra pela fase documental do vínculo (entrada / atividade / demissional).
+  phase: z.nativeEnum(LifecyclePhase).optional(),
   createdFrom: dateLike,
   createdTo: dateLike,
 
@@ -223,6 +228,8 @@ export const addManualWorkerRequirementSchema = z.object({
   referenceDate: dateLike,
   /** Vínculo (obra) ao qual a exigência manual pertence. */
   assignmentId: z.string().optional(),
+  /** Fase em que a cobrança avulsa entra. Padrão: a fase atual do vínculo. */
+  phase: z.nativeEnum(LifecyclePhase).optional(),
 });
 
 export type AddManualWorkerRequirementInput = z.infer<
@@ -242,6 +249,8 @@ export const listAllRequirementsQuerySchema = z.object({
   contractorId: z.string().optional(),
   workerId: z.string().optional(),
   assignmentId: z.string().optional(),
+  /// Filtra as cobranças por fase (entrada / atividade / saída).
+  phase: z.nativeEnum(LifecyclePhase).optional(),
   page: z.coerce.number().int().positive().default(1),
   pageSize: z.coerce.number().int().positive().max(200).default(50),
 });
@@ -258,4 +267,13 @@ export const setWorkerRequirementApplicabilitySchema = z.object({
 
 export type SetWorkerRequirementApplicabilityInput = z.infer<
   typeof setWorkerRequirementApplicabilitySchema
+>;
+
+/** Corpo da transição de fase do vínculo. */
+export const changeAssignmentPhaseSchema = z.object({
+  phase: z.nativeEnum(LifecyclePhase),
+});
+
+export type ChangeAssignmentPhaseInput = z.infer<
+  typeof changeAssignmentPhaseSchema
 >;

@@ -17,6 +17,7 @@ import {
   recomputeRequirementItem,
   recomputeWorkerRequirements,
 } from "../requirements/requirement-status.js";
+import { autoAdvanceWorkerAssignments } from "../requirements/lifecycle.js";
 import {
   sendRejectionNotice,
   type RejectionNoticeInput,
@@ -297,6 +298,8 @@ export class DocumentService {
     if (updated.ownerType === DocumentOwnerType.WORKER && updated.workerId) {
       await recomputeWorkerAccessValidity(updated.workerId);
       await recomputeWorkerRequirements(updated.workerId);
+      // Aprovar o último documento de entrada libera o vínculo para atividade.
+      await autoAdvanceWorkerAssignments(updated.workerId);
     }
 
     return updated;

@@ -1,4 +1,5 @@
 import {
+  LifecyclePhase,
   RequirementCollectionStatus,
   RequirementSource,
   RequirementTarget,
@@ -6,6 +7,10 @@ import {
 } from "@prisma/client";
 import { prisma } from "../../lib/prisma.js";
 import { BadRequest, NotFound } from "../../lib/errors.js";
+import {
+  materializeRequirementsForPhases,
+  phasesToMaterialize,
+} from "./lifecycle.js";
 import {
   importDefinitionRowSchema,
   importNameDescRowSchema,
@@ -27,6 +32,20 @@ type ImportBatchResult = {
   results: ImportRowResult[];
 };
 
+/**
+ * Fase só faz sentido para exigência de colaborador — fornecedor não tem ciclo
+ * de admissão/desligamento. Lista vazia cairia num registro que nunca é
+ * cobrado, então o padrão é ATIVIDADE.
+ */
+function normalizePhases(
+  target: RequirementTarget,
+  phases?: LifecyclePhase[] | null,
+): LifecyclePhase[] {
+  if (target !== RequirementTarget.WORKER) return [LifecyclePhase.ATIVIDADE];
+  if (!phases || phases.length === 0) return [LifecyclePhase.ATIVIDADE];
+  return [...new Set(phases)];
+}
+
 export class RequirementsService {
   private async validateRequirementIds(
     tx: Prisma.TransactionClient,
@@ -47,53 +66,32 @@ export class RequirementsService {
     return defs.map((d) => d.id);
   }
 
+  /**
+   * Propaga uma mudança no template da função para os vínculos que já a usam.
+   * Cada vínculo só recebe as exigências das fases que ele já alcançou — quem
+   * está em atividade não volta a dever documento de admissão.
+   */
   private async applyFunctionTemplateToWorkers(
     tx: Prisma.TransactionClient,
     companyId: string,
     functionId: string,
     requirementIds: string[],
   ) {
+    if (!requirementIds.length) return;
     // `functionId` vive em WorkerAssignment (vínculo por obra), não em Worker.
     const assignments = await tx.workerAssignment.findMany({
       where: { companyId, functionId },
-      select: { id: true, workerId: true },
-    });
-    if (!assignments.length || !requirementIds.length) return;
-
-    const defs = await tx.documentRequirementDefinition.findMany({
-      where: { id: { in: requirementIds }, companyId, target: RequirementTarget.WORKER },
+      select: { id: true, workerId: true, phase: true },
     });
 
     for (const assignment of assignments) {
-      const existing = await tx.workerRequirementItem.findMany({
-        where: {
-          companyId,
-          assignmentId: assignment.id,
-          source: RequirementSource.FUNCTION_TEMPLATE,
-          requirementId: { in: requirementIds },
-        },
-        select: { requirementId: true },
+      await materializeRequirementsForPhases(tx, {
+        companyId,
+        workerId: assignment.workerId,
+        assignmentId: assignment.id,
+        functionId,
+        phases: phasesToMaterialize(assignment.phase),
       });
-      const existingIds = new Set(existing.map((e) => e.requirementId));
-
-      for (const def of defs) {
-        if (existingIds.has(def.id)) continue;
-        await tx.workerRequirementItem.create({
-          data: {
-            companyId,
-            workerId: assignment.workerId,
-            assignmentId: assignment.id,
-            requirementId: def.id,
-            source: RequirementSource.FUNCTION_TEMPLATE,
-            status: RequirementCollectionStatus.NOT_SENT,
-            name: def.name,
-            documentType: def.documentType,
-            frequency: def.frequency,
-            monthlyDueDay: def.monthlyDueDay ?? undefined,
-            referenceDate: def.referenceDate ?? undefined,
-          },
-        });
-      }
     }
   }
 
@@ -172,6 +170,7 @@ export class RequirementsService {
         frequency: data.frequency,
         monthlyDueDay: data.monthlyDueDay,
         referenceDate: data.referenceDate,
+        phases: normalizePhases(data.target, data.phases),
         attachmentFormats: data.attachmentFormats,
         attachmentRequired: data.attachmentRequired ?? true,
         competenceMode: data.competenceMode ?? "NONE",
@@ -267,12 +266,18 @@ export class RequirementsService {
   ) {
     const existing = await prisma.documentRequirementDefinition.findFirst({
       where: { id, companyId },
-      select: { id: true },
+      select: { id: true, target: true, phases: true },
     });
     if (!existing) throw NotFound("Registro documental não encontrado");
+    const target = data.target ?? existing.target;
     return prisma.documentRequirementDefinition.update({
       where: { id },
-      data,
+      data: {
+        ...data,
+        ...(data.phases !== undefined || data.target !== undefined
+          ? { phases: normalizePhases(target, data.phases ?? existing.phases) }
+          : {}),
+      },
     });
   }
 
@@ -651,6 +656,7 @@ export class RequirementsService {
             frequency: data.frequency,
             monthlyDueDay: data.monthlyDueDay,
             referenceDate: data.referenceDate,
+            phases: normalizePhases(data.target as RequirementTarget, data.phases),
             active: true,
           },
         });

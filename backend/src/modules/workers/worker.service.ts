@@ -1,9 +1,11 @@
 import {
   DocumentOwnerType,
   DocumentStatus,
+  LifecyclePhase,
   RequirementCollectionStatus,
   RequirementFrequency,
   RequirementSource,
+  WorkerStatus,
   type Prisma,
 } from "@prisma/client";
 import { prisma } from "../../lib/prisma.js";
@@ -18,6 +20,14 @@ import {
 } from "../../lib/scope.js";
 import { generateNeoAccessToken } from "../../utils/access-hash.js";
 import { recomputeRequirementItem, recomputeWorkerRequirements } from "../requirements/requirement-status.js";
+import {
+  assertCanInactivate,
+  autoAdvanceFromEntrada,
+  materializeRequirementsForPhases,
+  phasesToMaterialize,
+  readPhaseGate,
+  transitionAssignmentPhase,
+} from "../requirements/lifecycle.js";
 import { decrypt, encrypt, hashCpf } from "../../lib/crypto.js";
 import { env } from "../../config/env.js";
 import { pickPrimaryAssignment } from "./worker.present.js";
@@ -64,6 +74,7 @@ const WORKER_FULL_INCLUDE = {
           effectiveStatus: true,
           expiresAt: true,
           status: true,
+          phase: true,
           requirement: {
             select: { id: true, name: true, frequency: true },
           },
@@ -275,8 +286,13 @@ export class WorkerService {
   }
 
   /**
-   * Sincroniza exigências de uma função para um assignment específico.
-   * Não duplica exigências já existentes para o mesmo assignment.
+   * Materializa as exigências da função para um vínculo, respeitando a fase
+   * em que ele está. Um vínculo recém-criado (ENTRADA) recebe as cobranças de
+   * entrada e de atividade; as de saída só nascem no processo demissional.
+   *
+   * Quando a função não tem nenhuma exigência de entrada, o vínculo já sobe
+   * para ATIVIDADE — do contrário ficaria barrado na catraca sem ter o que
+   * cobrar.
    */
   private async syncFunctionRequirementsToAssignment(
     tx: Prisma.TransactionClient,
@@ -285,48 +301,36 @@ export class WorkerService {
       workerId: string;
       assignmentId: string;
       functionId: string;
+      phase?: LifecyclePhase;
       createdById?: string;
     },
   ) {
-    const defs = await tx.workerFunctionRequirement.findMany({
-      where: {
-        functionId: params.functionId,
-        required: true,
-        requirement: { companyId: params.companyId, active: true, target: "WORKER" },
-      },
-      include: { requirement: true },
+    const phase = params.phase ?? LifecyclePhase.ENTRADA;
+    await materializeRequirementsForPhases(tx, {
+      companyId: params.companyId,
+      workerId: params.workerId,
+      assignmentId: params.assignmentId,
+      functionId: params.functionId,
+      phases: phasesToMaterialize(phase),
+      createdById: params.createdById,
     });
+  }
 
-    const existing = await tx.workerRequirementItem.findMany({
-      where: {
-        companyId: params.companyId,
-        assignmentId: params.assignmentId,
-        source: RequirementSource.FUNCTION_TEMPLATE,
-        requirementId: { not: null },
-      },
-      select: { requirementId: true },
+  /**
+   * Libera o vínculo da fase de entrada quando não sobrou nada a cobrar.
+   * Chamado logo após a criação (empresa sem exigências de entrada) e depois
+   * de cada resolução de pendência.
+   */
+  private async releaseEntradaIfClear(
+    tx: Prisma.TransactionClient,
+    assignmentId: string,
+  ) {
+    const gate = await readPhaseGate(tx, assignmentId, LifecyclePhase.ENTRADA);
+    if (!gate.clear) return;
+    await tx.workerAssignment.update({
+      where: { id: assignmentId },
+      data: { phase: LifecyclePhase.ATIVIDADE, phaseUpdatedAt: new Date() },
     });
-    const existingRequirementIds = new Set(existing.map((item) => item.requirementId));
-
-    for (const rel of defs) {
-      if (existingRequirementIds.has(rel.requirementId)) continue;
-      await tx.workerRequirementItem.create({
-        data: {
-          companyId: params.companyId,
-          workerId: params.workerId,
-          assignmentId: params.assignmentId,
-          requirementId: rel.requirementId,
-          source: RequirementSource.FUNCTION_TEMPLATE,
-          status: RequirementCollectionStatus.NOT_SENT,
-          name: rel.requirement.name,
-          documentType: rel.requirement.documentType,
-          frequency: rel.requirement.frequency,
-          monthlyDueDay: rel.requirement.monthlyDueDay ?? undefined,
-          referenceDate: rel.requirement.referenceDate ?? undefined,
-          createdById: params.createdById,
-        },
-      });
-    }
   }
 
   /**
@@ -469,9 +473,12 @@ export class WorkerService {
       }
 
       if (uploadedDocs.length > 0) {
+        // Ordena por fase para que o documento entregue na admissão case com a
+        // cobrança de entrada, e não com a de atividade do mesmo registro.
         const requirementItems = await tx.workerRequirementItem.findMany({
           where: { companyId, assignmentId: assignment.id },
           select: { id: true, documentType: true, name: true },
+          orderBy: [{ phase: "asc" }, { createdAt: "asc" }],
         });
         const linkedItemIds = new Set<string>();
 
@@ -510,6 +517,8 @@ export class WorkerService {
           }
         }
       }
+
+      await this.releaseEntradaIfClear(tx, assignment.id);
 
       const w = await tx.worker.findUniqueOrThrow({
         where: { id: workerId },
@@ -588,7 +597,16 @@ export class WorkerService {
         });
       }
 
-      return assignment;
+      await this.releaseEntradaIfClear(tx, assignment.id);
+
+      return tx.workerAssignment.findUniqueOrThrow({
+        where: { id: assignment.id },
+        include: {
+          obra: { select: { id: true, name: true } },
+          contractor: { select: { id: true, name: true } },
+          function: { select: { id: true, name: true } },
+        },
+      });
     });
   }
 
@@ -795,6 +813,7 @@ export class WorkerService {
     if (query.contractorId) assignmentFilter.contractorId = query.contractorId;
     if (query.functionId) assignmentFilter.functionId = query.functionId;
     if (query.status) assignmentFilter.status = query.status;
+    if (query.phase) assignmentFilter.phase = query.phase;
     if (query.registration?.trim()) {
       assignmentFilter.registration = {
         contains: query.registration.trim(),
@@ -905,12 +924,31 @@ export class WorkerService {
 
     const assignment = await prisma.workerAssignment.findFirst({
       where: { id: assignmentId, workerId, companyId },
-      select: { id: true, functionId: true },
+      select: { id: true, functionId: true, phase: true, status: true },
     });
     if (!assignment) throw NotFound("Vínculo não encontrado");
 
     if (data.contractorId) {
       await ensureContractorInScope(scope, data.contractorId);
+    }
+
+    // Mudança de fase passa pelas travas do processo (entrada aprovada antes
+    // de liberar para atividade; saída materializada ao abrir o desligamento).
+    if (data.phase !== undefined && data.phase !== assignment.phase) {
+      await transitionAssignmentPhase({
+        companyId,
+        assignmentId,
+        to: data.phase,
+      });
+    }
+
+    // Inativar exige ter passado pelo processo demissional com a documentação
+    // de saída resolvida.
+    if (
+      data.status === WorkerStatus.INACTIVE &&
+      assignment.status !== WorkerStatus.INACTIVE
+    ) {
+      await assertCanInactivate(companyId, assignmentId);
     }
 
     const nextFunctionId =
@@ -942,12 +980,43 @@ export class WorkerService {
       });
 
       if (nextFunctionId && nextFunctionId !== assignment.functionId) {
+        // Vínculo criado sem função nasce sem nada a cobrar e por isso já sobe
+        // para ATIVIDADE. Ao receber a primeira função, a admissão ainda não
+        // aconteceu de fato: volta para ENTRADA para cobrar a documentação
+        // admissional (e é liberado na hora se a função não exigir nenhuma).
+        const nuncaCobrado =
+          !assignment.functionId && updated.requirementItems.length === 0;
+        const phaseParaMaterializar = nuncaCobrado
+          ? LifecyclePhase.ENTRADA
+          : updated.phase;
+
+        if (nuncaCobrado && updated.phase !== LifecyclePhase.ENTRADA) {
+          await tx.workerAssignment.update({
+            where: { id: assignmentId },
+            data: { phase: LifecyclePhase.ENTRADA, phaseUpdatedAt: new Date() },
+          });
+        }
+
         await this.syncFunctionRequirementsToAssignment(tx, {
           companyId,
           workerId,
           assignmentId,
           functionId: nextFunctionId,
+          phase: phaseParaMaterializar,
         });
+
+        if (nuncaCobrado) {
+          await this.releaseEntradaIfClear(tx, assignmentId);
+          return tx.workerAssignment.findUniqueOrThrow({
+            where: { id: assignmentId },
+            include: {
+              obra: { select: { id: true, name: true } },
+              contractor: { select: { id: true, name: true } },
+              function: { select: { id: true, name: true } },
+              requirementItems: { select: { effectiveStatus: true } },
+            },
+          });
+        }
       }
 
       return updated;
@@ -1020,6 +1089,7 @@ export class WorkerService {
         : {}),
       ...(query.workerId ? { workerId: query.workerId } : {}),
       ...(query.assignmentId ? { assignmentId: query.assignmentId } : {}),
+      ...(query.phase ? { phase: query.phase } : {}),
       ...(scope.allowedDocumentTypes
         ? { documentType: { in: scope.allowedDocumentTypes } }
         : {}),
@@ -1040,6 +1110,7 @@ export class WorkerService {
             select: {
               id: true,
               role: true,
+              phase: true,
               contractor: { select: { id: true, name: true } },
               obra: { select: { id: true, name: true } },
             },
@@ -1096,7 +1167,12 @@ export class WorkerService {
           },
         },
         assignment: {
-          select: { id: true, obraId: true, obra: { select: { id: true, name: true } } },
+          select: {
+            id: true,
+            obraId: true,
+            phase: true,
+            obra: { select: { id: true, name: true } },
+          },
         },
         latestDocument: {
           select: {
@@ -1132,12 +1208,14 @@ export class WorkerService {
     }
 
     // Valida assignmentId se informado
+    let assignmentPhase: LifecyclePhase | null = null;
     if (data.assignmentId) {
       const assignment = await prisma.workerAssignment.findFirst({
         where: { id: data.assignmentId, workerId, companyId },
-        select: { id: true },
+        select: { id: true, phase: true },
       });
       if (!assignment) throw NotFound("Vínculo não encontrado");
+      assignmentPhase = assignment.phase;
     }
 
     const created = await prisma.workerRequirementItem.create({
@@ -1152,6 +1230,9 @@ export class WorkerService {
         frequency: data.frequency,
         monthlyDueDay: data.monthlyDueDay,
         referenceDate: data.referenceDate,
+        // Sem fase explícita, a cobrança avulsa entra na fase em que o vínculo
+        // está — é o que o usuário vê na tela ao criá-la.
+        phase: data.phase ?? assignmentPhase ?? LifecyclePhase.ATIVIDADE,
         createdById,
       },
     });
@@ -1169,7 +1250,7 @@ export class WorkerService {
     await this.findById(scope, workerId);
     const item = await prisma.workerRequirementItem.findFirst({
       where: { id: itemId, companyId, workerId },
-      select: { id: true },
+      select: { id: true, assignmentId: true, phase: true },
     });
     if (!item) throw NotFound("Exigência do colaborador não encontrada");
 
@@ -1191,7 +1272,86 @@ export class WorkerService {
       },
     });
     await recomputeRequirementItem(itemId);
+    // Dispensar a última pendência de entrada libera o colaborador.
+    if (item.phase === LifecyclePhase.ENTRADA) {
+      await autoAdvanceFromEntrada(item.assignmentId);
+    }
     return updated;
+  }
+
+  /**
+   * Situação do vínculo no ciclo entrada → atividade → saída, com o placar de
+   * cada fase. É o que a tela usa para habilitar (ou explicar o bloqueio de)
+   * "Liberar para atividade", "Abrir processo demissional" e "Inativar".
+   */
+  async getPhaseStatus(scope: AuthScope, workerId: string, assignmentId?: string) {
+    const companyId = scope.companyId;
+    await this.findById(scope, workerId);
+
+    const resolvedId =
+      assignmentId ?? (await this.resolvePrimaryAssignmentId(scope, workerId));
+    if (!resolvedId) throw NotFound("Vínculo não encontrado");
+
+    const assignment = await prisma.workerAssignment.findFirst({
+      where: { id: resolvedId, workerId, companyId },
+      select: {
+        id: true,
+        phase: true,
+        phaseUpdatedAt: true,
+        status: true,
+        obra: { select: { id: true, name: true } },
+      },
+    });
+    if (!assignment) throw NotFound("Vínculo não encontrado");
+
+    const [entrada, atividade, saida] = await Promise.all([
+      readPhaseGate(prisma, assignment.id, LifecyclePhase.ENTRADA),
+      readPhaseGate(prisma, assignment.id, LifecyclePhase.ATIVIDADE),
+      readPhaseGate(prisma, assignment.id, LifecyclePhase.SAIDA),
+    ]);
+
+    return {
+      assignmentId: assignment.id,
+      obra: assignment.obra,
+      phase: assignment.phase,
+      phaseUpdatedAt: assignment.phaseUpdatedAt,
+      status: assignment.status,
+      gates: { ENTRADA: entrada, ATIVIDADE: atividade, SAIDA: saida },
+      /** Pode liberar para atividade (só faz sentido em ENTRADA). */
+      canActivate: assignment.phase === LifecyclePhase.ENTRADA && entrada.clear,
+      /** Pode inativar: passou pelo desligamento com a saída resolvida. */
+      canInactivate:
+        assignment.status !== WorkerStatus.INACTIVE &&
+        assignment.phase === LifecyclePhase.SAIDA &&
+        saida.clear,
+    };
+  }
+
+  /** Move o vínculo de fase (com as travas do processo) e devolve a situação. */
+  async changePhase(
+    scope: AuthScope,
+    workerId: string,
+    assignmentId: string,
+    phase: LifecyclePhase,
+    createdById?: string,
+  ) {
+    const companyId = scope.companyId;
+    await this.findById(scope, workerId);
+
+    const assignment = await prisma.workerAssignment.findFirst({
+      where: { id: assignmentId, workerId, companyId },
+      select: { id: true },
+    });
+    if (!assignment) throw NotFound("Vínculo não encontrado");
+
+    await transitionAssignmentPhase({
+      companyId,
+      assignmentId,
+      to: phase,
+      createdById,
+    });
+
+    return this.getPhaseStatus(scope, workerId, assignmentId);
   }
 
   /**

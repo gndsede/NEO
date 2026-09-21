@@ -83,6 +83,15 @@ router.patch(
   asyncHandler(workerController.updateAssignment),
 );
 
+// Ciclo documental do vínculo: entrada → atividade → processo demissional.
+router.get("/:id/phase", canViewWorkers, asyncHandler(workerController.getPhase));
+
+router.patch(
+  "/:id/assignments/:assignmentId/phase",
+  requireCapability("colaboradores.manage"),
+  asyncHandler(workerController.changePhase),
+);
+
 router.patch(
   "/:id/photo",
   requireCapability("colaboradores.manage"),
