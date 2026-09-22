@@ -30,4 +30,16 @@ export interface StorageDriver {
    * Drivers sem suporte devem retornar a URL pública.
    */
   getSignedUrl?(key: string, expiresInSeconds?: number): Promise<string>;
+  /**
+   * Lê o conteúdo de volta pela chave. Usado por quem precisa dos bytes no
+   * próprio processo (ex.: compor a foto no crachá) sem depender de um
+   * round-trip HTTP na URL pública — que falha quando o host/porta gravado
+   * no upload não é alcançável a partir do próprio servidor.
+   */
+  download(key: string): Promise<Buffer>;
+  /**
+   * Extrai a chave a partir de uma URL gerada por este driver.
+   * Retorna `null` quando a URL não pertence a ele.
+   */
+  keyFromUrl(url: string): string | null;
 }

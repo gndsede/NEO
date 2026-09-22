@@ -7,6 +7,7 @@ import { prisma } from "../../lib/prisma.js";
 import { BadRequest } from "../../lib/errors.js";
 import { logger } from "../../lib/logger.js";
 import { signLocalFileUrl } from "../../lib/file-signing.js";
+import { getStorage } from "../../lib/storage/index.js";
 import {
   assignmentScopeWhere,
   workerScopeWhere,
@@ -84,13 +85,38 @@ async function gerarQrBuffer(valor: string): Promise<Buffer> {
   }) as Promise<Buffer>;
 }
 
-async function baixarFoto(url: string): Promise<Buffer | undefined> {
+/**
+ * Carrega a foto do colaborador.
+ *
+ * A URL gravada no banco tem o host/porta do momento do upload (o driver local
+ * grava `localhost:3333`): buscá-la por HTTP a partir do próprio servidor falha
+ * em produção — a API escuta outra porta — e o crachá saía sem foto, em
+ * silêncio. Por isso lemos os bytes direto do storage pela chave; o fetch fica
+ * só como fallback para URLs que não pertencem ao driver atual.
+ */
+async function baixarFoto(url: string): Promise<Buffer> {
+  const storage = await getStorage();
+  const key = storage.keyFromUrl(url);
+  if (key) return storage.download(key);
+
+  // URLs do storage local exigem assinatura — assina antes de baixar.
+  const res = await fetch(signLocalFileUrl(url));
+  if (!res.ok) {
+    throw new Error(`foto inacessível (HTTP ${res.status})`);
+  }
+  return Buffer.from(await res.arrayBuffer());
+}
+
+/** Igual a `baixarFoto`, mas nunca derruba a geração: registra e segue sem foto. */
+async function carregarFoto(
+  url: string | null,
+  workerId: string,
+): Promise<Buffer | undefined> {
+  if (!url) return undefined;
   try {
-    // URLs do storage local agora exigem assinatura — assina antes de baixar.
-    const res = await fetch(signLocalFileUrl(url));
-    if (!res.ok) return undefined;
-    return Buffer.from(await res.arrayBuffer());
-  } catch {
+    return await baixarFoto(url);
+  } catch (err) {
+    logger.warn("cracha_foto_indisponivel", { err, workerId, photoUrl: url });
     return undefined;
   }
 }
@@ -266,9 +292,7 @@ export async function gerarPorWorker(
 ): Promise<Buffer> {
   const payload = await badgeService.generate(scope, workerId);
 
-  const fotoBuf = payload.worker.photoUrl
-    ? await baixarFoto(payload.worker.photoUrl)
-    : undefined;
+  const fotoBuf = await carregarFoto(payload.worker.photoUrl, workerId);
 
   const qrBuf = await gerarQrBuffer(payload.access.qrContent);
   const imgBuf = await compositar(
@@ -343,9 +367,7 @@ export async function gerarLote(
   for (const alvo of alvos) {
     try {
       const payload = await badgeService.generate(scope, alvo.id);
-      const fotoBuf = payload.worker.photoUrl
-        ? await baixarFoto(payload.worker.photoUrl)
-        : undefined;
+      const fotoBuf = await carregarFoto(payload.worker.photoUrl, alvo.id);
       const qrBuf = await gerarQrBuffer(payload.access.qrContent);
       const imgBuf = await compositar(tpl, qrBuf, fotoBuf);
       adicionarPagina(doc, imgBuf, {

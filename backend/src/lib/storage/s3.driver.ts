@@ -88,4 +88,27 @@ export class S3StorageDriver implements StorageDriver {
       { expiresIn: expiresInSeconds },
     );
   }
+
+  async download(key: string): Promise<Buffer> {
+    const res = await this.client.send(
+      new GetObjectCommand({ Bucket: this.bucket, Key: key }),
+    );
+    if (!res.Body) throw new Error(`Objeto vazio no S3: ${key}`);
+    return Buffer.from(await res.Body.transformToByteArray());
+  }
+
+  keyFromUrl(url: string): string | null {
+    let parsed: URL;
+    try {
+      parsed = new URL(url);
+    } catch {
+      return null;
+    }
+    const prefix = new URL(this.buildPublicUrl("")).pathname;
+    const base = new URL(this.buildPublicUrl("x"));
+    if (parsed.host !== base.host) return null;
+    if (!parsed.pathname.startsWith(prefix)) return null;
+    const key = decodeURIComponent(parsed.pathname.slice(prefix.length));
+    return key || null;
+  }
 }

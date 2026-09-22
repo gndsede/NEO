@@ -64,6 +64,34 @@ export class SupabaseStorageDriver implements StorageDriver {
     }
   }
 
+  async download(key: string): Promise<Buffer> {
+    const { data, error } = await this.client.storage
+      .from(this.bucket)
+      .download(key);
+    if (error || !data) {
+      throw new Error(
+        `Falha ao baixar do Supabase: ${error?.message ?? "sem conteúdo"}`,
+      );
+    }
+    return Buffer.from(await data.arrayBuffer());
+  }
+
+  keyFromUrl(url: string): string | null {
+    let parsed: URL;
+    try {
+      parsed = new URL(url);
+    } catch {
+      return null;
+    }
+    // URL pública: /storage/v1/object/public/<bucket>/<key>
+    // URL assinada: /storage/v1/object/sign/<bucket>/<key>?token=...
+    const m = parsed.pathname.match(
+      /\/storage\/v1\/object\/(?:public|sign|authenticated)\/([^/]+)\/(.+)$/,
+    );
+    if (!m || m[1] !== this.bucket) return null;
+    return decodeURIComponent(m[2]);
+  }
+
   async getSignedUrl(key: string, expiresInSeconds = 900): Promise<string> {
     const { data, error } = await this.client.storage
       .from(this.bucket)
