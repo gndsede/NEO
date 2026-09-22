@@ -1,6 +1,9 @@
 FROM node:22-bookworm-slim AS base
 WORKDIR /app
-RUN apt-get update && apt-get install -y --no-install-recommends openssl ca-certificates \
+# util-linux traz o setpriv, usado pelo entrypoint para largar o root depois de
+# ajustar o dono do volume de uploads. Já vem na imagem base do Debian; fica
+# explícito para que uma troca de imagem não quebre o boot em silêncio.
+RUN apt-get update && apt-get install -y --no-install-recommends openssl ca-certificates util-linux \
   && rm -rf /var/lib/apt/lists/*
 
 FROM base AS deps
@@ -33,10 +36,11 @@ COPY backend/scripts/docker-entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 # Defesa em profundidade (CIS Docker Benchmark 4.1): o processo Node roda como
 # usuário sem privilégios — uma RCE via dependência não ganha root no container.
-# O diretório de uploads (driver de storage "local") precisa ser gravável.
+# O container inicia como root e o entrypoint larga o privilégio com setpriv:
+# um volume montado em /app/uploads nasce pertencendo a root, e sem o chown
+# prévio todo upload falharia com EACCES. Node nunca chega a rodar como root.
 RUN useradd --system --uid 1001 --create-home appuser \
   && mkdir -p /app/uploads \
   && chown -R appuser:appuser /app/uploads /home/appuser
-USER appuser
 EXPOSE 3333
 CMD ["/entrypoint.sh"]
