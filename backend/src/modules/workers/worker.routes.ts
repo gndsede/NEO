@@ -111,6 +111,12 @@ router.post(
   asyncHandler(workerController.addManualRequirement),
 );
 
+router.post(
+  "/:id/requirements/catalog",
+  requireCapability("colaboradores.manage"),
+  asyncHandler(workerController.addCatalogRequirements),
+);
+
 router.patch(
   "/:id/requirements/:itemId/applicability",
   requireCapability("documentos.mark_na"),

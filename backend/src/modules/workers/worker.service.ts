@@ -5,6 +5,7 @@ import {
   RequirementCollectionStatus,
   RequirementFrequency,
   RequirementSource,
+  RequirementTarget,
   WorkerStatus,
   type Prisma,
 } from "@prisma/client";
@@ -33,6 +34,7 @@ import { env } from "../../config/env.js";
 import { pickPrimaryAssignment } from "./worker.present.js";
 import {
   importWorkerRowSchema,
+  type AddCatalogWorkerRequirementsInput,
   type AddManualWorkerRequirementInput,
   type CreateAssignmentInput,
   type CreateWorkerInput,
@@ -1238,6 +1240,96 @@ export class WorkerService {
     });
     await recomputeRequirementItem(created.id);
     return created;
+  }
+
+  /**
+   * Cobrança individual a partir do catálogo de registros. Cada registro entra
+   * uma única vez por colaborador: se ele já tem item com esse registro (pela
+   * função ou avulso), a requisição é recusada — a tela já desabilita esses,
+   * isto é a garantia contra duplo clique e abas abertas.
+   *
+   * Um registro cobrado em mais de uma fase gera um item por fase, igual ao
+   * template da função.
+   */
+  async addCatalogRequirements(
+    scope: AuthScope,
+    workerId: string,
+    data: AddCatalogWorkerRequirementsInput,
+    createdById?: string,
+  ) {
+    const companyId = scope.companyId;
+    await this.findById(scope, workerId);
+
+    const defs = await prisma.documentRequirementDefinition.findMany({
+      where: {
+        id: { in: data.requirementIds },
+        companyId,
+        target: RequirementTarget.WORKER,
+        active: true,
+      },
+    });
+    if (defs.length !== data.requirementIds.length) {
+      throw BadRequest("Registro inexistente, inativo ou não destinado a colaborador.");
+    }
+
+    const existing = await prisma.workerRequirementItem.findMany({
+      where: { companyId, workerId, requirementId: { in: data.requirementIds } },
+      select: { requirementId: true },
+    });
+    if (existing.length > 0) {
+      const dup = new Set(existing.map((e) => e.requirementId));
+      const names = defs.filter((d) => dup.has(d.id)).map((d) => d.name);
+      throw Conflict(`Já adicionado a este colaborador: ${names.join(", ")}.`);
+    }
+
+    let assignmentId: string | null = null;
+    if (data.assignmentId) {
+      const assignment = await prisma.workerAssignment.findFirst({
+        where: { id: data.assignmentId, workerId, companyId },
+        select: { id: true },
+      });
+      if (!assignment) throw NotFound("Vínculo não encontrado");
+      assignmentId = assignment.id;
+    } else {
+      const assignments = await prisma.workerAssignment.findMany({
+        where: { workerId, companyId, status: { not: WorkerStatus.INACTIVE } },
+        select: { id: true, obraId: true },
+        orderBy: { createdAt: "asc" },
+      });
+      assignmentId = pickPrimaryAssignment(assignments, scope)?.id ?? null;
+    }
+
+    const created = await prisma.$transaction(async (tx) => {
+      const ids: string[] = [];
+      for (const def of defs) {
+        const phases = def.phases.length > 0 ? def.phases : [LifecyclePhase.ATIVIDADE];
+        for (const phase of phases) {
+          const item = await tx.workerRequirementItem.create({
+            data: {
+              companyId,
+              workerId,
+              assignmentId,
+              requirementId: def.id,
+              source: RequirementSource.MANUAL,
+              status: RequirementCollectionStatus.NOT_SENT,
+              name: def.name,
+              documentType: def.documentType,
+              frequency: def.frequency,
+              monthlyDueDay: def.monthlyDueDay ?? undefined,
+              referenceDate: def.referenceDate ?? undefined,
+              phase,
+              createdById,
+            },
+            select: { id: true },
+          });
+          ids.push(item.id);
+        }
+      }
+      return ids;
+    });
+
+    for (const id of created) await recomputeRequirementItem(id);
+    return { created: created.length };
   }
 
   async setRequirementApplicability(

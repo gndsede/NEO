@@ -236,6 +236,21 @@ export type AddManualWorkerRequirementInput = z.infer<
   typeof addManualWorkerRequirementSchema
 >;
 
+/** Cobrança individual a partir de registros do catálogo (target = WORKER). */
+export const addCatalogWorkerRequirementsSchema = z.object({
+  requirementIds: z
+    .array(z.string().min(1))
+    .min(1, "Selecione ao menos um registro")
+    .max(200)
+    .transform((ids) => [...new Set(ids)]),
+  /** Vínculo (obra) ao qual as cobranças pertencem. Padrão: o vínculo principal ativo. */
+  assignmentId: z.string().optional(),
+});
+
+export type AddCatalogWorkerRequirementsInput = z.infer<
+  typeof addCatalogWorkerRequirementsSchema
+>;
+
 export const listAllRequirementsQuerySchema = z.object({
   effectiveStatus: z
     .union([

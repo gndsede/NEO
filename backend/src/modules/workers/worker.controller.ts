@@ -1,6 +1,7 @@
 import type { Request, Response } from "express";
 import { workerService } from "./worker.service.js";
 import {
+  addCatalogWorkerRequirementsSchema,
   addManualWorkerRequirementSchema,
   changeAssignmentPhaseSchema,
   createAssignmentSchema,
@@ -225,6 +226,19 @@ export const workerController = {
       req.user?.id,
     );
     res.status(201).json(item);
+  },
+
+  /** POST /workers/:id/requirements/catalog */
+  async addCatalogRequirements(req: Request, res: Response) {
+    const scope = scopeFromRequest(req);
+    const data = addCatalogWorkerRequirementsSchema.parse(req.body);
+    const result = await workerService.addCatalogRequirements(
+      scope,
+      String(req.params.id),
+      data,
+      req.user?.id,
+    );
+    res.status(201).json(result);
   },
 
   /** PATCH /workers/:id/requirements/:itemId/applicability */
