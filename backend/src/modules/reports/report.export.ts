@@ -7,6 +7,7 @@ import type { Response } from "express";
 import { EffectiveRequirementStatus } from "@prisma/client";
 import { prisma } from "../../lib/prisma.js";
 import { decrypt } from "../../lib/crypto.js";
+import { formatCpf, formatCpfCnpj } from "../../lib/br-format.js";
 import {
   assignmentScopeWhere,
   contractorScopeWhere,
@@ -264,7 +265,7 @@ export async function reportWorkers(
 
   const rows = items.map((a) => [
     a.worker.fullName,
-    decrypt(a.worker.cpf),
+    formatCpf(decrypt(a.worker.cpf)),
     a.worker.rg ? decrypt(a.worker.rg) : "—",
     a.function?.name ?? a.role,
     a.contractor.name,
@@ -331,7 +332,7 @@ export async function reportCompliance(
 
   const rows = items.map((item) => [
     item.worker.fullName,
-    decrypt(item.worker.cpf),
+    formatCpf(decrypt(item.worker.cpf)),
     item.assignment?.contractor?.name ?? "—",
     item.name,
     item.documentType,
@@ -407,7 +408,7 @@ export async function reportAccess(
   const rows = items.map((log) => [
     fmtDateTime(log.occurredAt),
     log.worker?.fullName ?? "—",
-    log.worker?.cpf ? decrypt(log.worker.cpf) : "—",
+    log.worker?.cpf ? formatCpf(decrypt(log.worker.cpf)) : "—",
     "—",
     directionLabel[log.direction] ?? log.direction,
     resultLabel[log.result] ?? log.result,
@@ -480,7 +481,7 @@ export async function reportContractorPending(
     const unique = [...new Set(all.map((r) => r.name))];
     return [
       c.name,
-      c.cnpj ?? "—",
+      c.cnpj ? formatCpfCnpj(c.cnpj) : "—",
       c.obra.name,
       String(c._count.workerAssignments),
       String(all.length),

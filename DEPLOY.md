@@ -107,9 +107,17 @@ Serviço: Docker, a partir do `Dockerfile` na **raiz** do repositório
 ### Storage
 
 `STORAGE_DRIVER` fica em `local` por padrão, e o disco do container é efêmero —
-**uploads somem a cada deploy**. Para valer em produção, defina
-`STORAGE_DRIVER=s3` (ou `supabase`) com as credenciais correspondentes, e
-`S3_PUBLIC_URL` para a URL pública dos arquivos.
+**uploads somem a cada deploy**. Duas saídas:
+
+- **Volume da Railway** (mais rápido): no canvas do projeto, botão direito (ou
+  Ctrl+K) → *Volume* → escolha o serviço da API, mount path `/app/uploads`.
+  Mantém `STORAGE_DRIVER=local`; o
+  `Dockerfile` da raiz já cria a pasta e acerta o dono.
+- **Storage externo**: `STORAGE_DRIVER=s3` (ou `supabase`) com as credenciais
+  correspondentes, e `S3_PUBLIC_URL` para a URL pública dos arquivos.
+
+Arquivos perdidos antes disso não voltam: o banco guarda a chave, mas o
+arquivo não existe mais — é preciso reenviar.
 
 ### Segredos — o que pode e o que não pode ser rotacionado
 
