@@ -2,7 +2,11 @@ import type { DocumentType, Prisma, UserProfile } from "@prisma/client";
 import type { Request } from "express";
 import { prisma } from "./prisma.js";
 import { Forbidden } from "./errors.js";
-import type { PermissionList } from "./permissions.js";
+import {
+  normalizePermissions,
+  type PermissionKey,
+  type PermissionList,
+} from "./permissions.js";
 
 export const OBRA_HEADER = "x-obra-id";
 
@@ -49,6 +53,27 @@ export async function loadAllowedDocumentTypesForUser(params: {
     for (const t of group.visibleDocumentTypes) restricted.add(t);
   }
   return [...restricted];
+}
+
+/**
+ * Permissões efetivas do usuário: as individuais (User.permissions) somadas
+ * às de todos os grupos ATIVOS dos quais ele é membro. Calculado a cada
+ * requisição para que mudanças no grupo valham sem novo login.
+ */
+export async function loadEffectivePermissions(params: {
+  userId: string;
+  companyId: string;
+  ownPermissions: unknown;
+}): Promise<PermissionList> {
+  const memberships = await prisma.userGroupMember.findMany({
+    where: { userId: params.userId, group: { companyId: params.companyId, active: true } },
+    select: { group: { select: { permissions: true } } },
+  });
+  const set = new Set<PermissionKey>(normalizePermissions(params.ownPermissions));
+  for (const { group } of memberships) {
+    for (const k of normalizePermissions(group.permissions)) set.add(k);
+  }
+  return [...set];
 }
 
 export async function loadObraIdsForUser(params: {

@@ -12,6 +12,7 @@ import { asyncHandler } from "../../middleware/async-handler.js";
 import { authenticate, requireCapability } from "../../middleware/auth.js";
 import { NotFound, Unauthorized } from "../../lib/errors.js";
 import { requirementsService } from "../requirements/requirements.service.js";
+import { computeEffectiveStatus } from "../requirements/requirement-status.js";
 import {
   contractorScopeWhere,
   ensureObraAccess,
@@ -218,9 +219,21 @@ router.get(
         obra: { select: { id: true, name: true } },
         type: { select: { id: true, name: true } },
         _count: { select: { workerAssignments: true, documents: true } },
+        requirementItems: {
+          select: { status: true, latestDocument: { select: { expiresAt: true } } },
+        },
       },
     });
-    res.json({ items });
+    // Item de fornecedor não persiste effectiveStatus (o de colaborador sim);
+    // deriva aqui para a listagem de documentos mostrar a mesma situação.
+    res.json({
+      items: items.map(({ requirementItems, ...c }) => ({
+        ...c,
+        requirementItems: requirementItems.map((it) => ({
+          effectiveStatus: computeEffectiveStatus(it.status, it.latestDocument?.expiresAt ?? null),
+        })),
+      })),
+    });
   }),
 );
 

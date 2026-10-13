@@ -13,8 +13,8 @@ import {
   twoFactorRateLimit,
 } from "../../middleware/rate-limit.js";
 import { BadRequest, Forbidden, NotFound, Unauthorized } from "../../lib/errors.js";
-import { hasAnyCapability, hasCapability, normalizePermissions } from "../../lib/permissions.js";
-import { loadObraIdsForUser } from "../../lib/scope.js";
+import { hasAnyCapability, hasCapability } from "../../lib/permissions.js";
+import { loadEffectivePermissions, loadObraIdsForUser } from "../../lib/scope.js";
 import { env } from "../../config/env.js";
 import { sendPasswordResetEmail } from "../../lib/password-reset-email.js";
 import { hashPassword, needsRehash, verifyPassword } from "../../lib/password.js";
@@ -248,7 +248,11 @@ router.post(
       });
     }
 
-    const permissions = normalizePermissions(user.permissions);
+    const permissions = await loadEffectivePermissions({
+      userId: user.id,
+      companyId: user.companyId,
+      ownPermissions: user.permissions,
+    });
     const obraIds = await loadObraIdsForUser({
       userId: user.id,
       companyId: user.companyId,
@@ -598,7 +602,11 @@ router.post(
 
     ensureCompanyActive(user.company);
 
-    const permissions = normalizePermissions(user.permissions);
+    const permissions = await loadEffectivePermissions({
+      userId: user.id,
+      companyId: user.companyId,
+      ownPermissions: user.permissions,
+    });
 
     if (!hasAnyCapability({ permissions }, ["catraca.manage", "catraca.view"])) {
       throw Forbidden(

@@ -43,6 +43,11 @@ const createSchema = z.object({
   /// futuras), independente da permissão obras.manage.
   allObrasAccess: z.coerce.boolean().optional(),
   permissions: permissionsSchema,
+  /// Grupos do usuário — obrigatório: é pelo grupo que o usuário recebe a
+  /// base de permissões e a visibilidade de documentos.
+  groupIds: z
+    .array(z.string().min(1), { error: "Selecione ao menos um grupo para o usuário." })
+    .min(1, "Selecione ao menos um grupo para o usuário."),
   active: z.coerce.boolean().optional(),
 });
 
@@ -54,6 +59,10 @@ const updateSchema = z.object({
   obraIds: z.array(z.string().min(1)).optional(),
   allObrasAccess: z.coerce.boolean().optional(),
   permissions: permissionsSchema,
+  groupIds: z
+    .array(z.string().min(1))
+    .min(1, "Selecione ao menos um grupo para o usuário.")
+    .optional(),
   active: z.coerce.boolean().optional(),
 });
 
@@ -75,10 +84,16 @@ async function publicUser(u: {
   allObrasAccess: boolean;
   createdAt: Date;
 }) {
-  const obraAccess = await prisma.userObraAccess.findMany({
-    where: { userId: u.id },
-    include: { obra: { select: { id: true, name: true, code: true } } },
-  });
+  const [obraAccess, memberships] = await Promise.all([
+    prisma.userObraAccess.findMany({
+      where: { userId: u.id },
+      include: { obra: { select: { id: true, name: true, code: true } } },
+    }),
+    prisma.userGroupMember.findMany({
+      where: { userId: u.id },
+      include: { group: { select: { id: true, name: true, active: true } } },
+    }),
+  ]);
   return {
     id: u.id,
     name: u.name,
@@ -90,8 +105,39 @@ async function publicUser(u: {
     allObrasAccess: u.allObrasAccess,
     active: u.active,
     permissions: normalizePermissions(u.permissions),
+    groupIds: memberships.map((m) => m.groupId),
+    groups: memberships.map((m) => m.group),
     createdAt: u.createdAt,
   };
+}
+
+/** Valida que os grupos existem e estão ativos no tenant. Na edição, um
+ *  grupo inativo do qual o usuário já é membro é mantido sem erro. */
+async function assertGroups(companyId: string, groupIds: string[], userId?: string) {
+  const unique = [...new Set(groupIds)];
+  const valid = await prisma.userGroup.count({
+    where: {
+      companyId,
+      id: { in: unique },
+      OR: [
+        { active: true },
+        ...(userId ? [{ members: { some: { userId } } }] : []),
+      ],
+    },
+  });
+  if (valid !== unique.length) {
+    throw BadRequest("Um ou mais grupos são inválidos ou estão inativos.");
+  }
+  return unique;
+}
+
+async function syncUserGroups(userId: string, groupIds: string[]) {
+  await prisma.$transaction(async (tx) => {
+    await tx.userGroupMember.deleteMany({ where: { userId } });
+    await tx.userGroupMember.createMany({
+      data: groupIds.map((groupId) => ({ userId, groupId })),
+    });
+  });
 }
 
 async function syncUserObraAccess(
@@ -173,6 +219,8 @@ router.post(
       throw BadRequest("Colaborador deve estar vinculado a uma empreiteira.");
     }
 
+    const groupIds = await assertGroups(companyId(req), data.groupIds);
+
     // Sem senha informada: fluxo padrão de convite por e-mail (o usuário
     // define a própria senha). Com senha: admin define o acesso na hora.
     const sendInvite = !data.password;
@@ -219,6 +267,7 @@ router.post(
       obraIds,
       allObrasAccess,
     );
+    await syncUserGroups(created.id, groupIds);
 
     let inviteSent: boolean | undefined;
     let inviteUrl: string | undefined;
@@ -244,7 +293,7 @@ router.post(
       action: "USER_CREATED",
       entityType: "user",
       entityId: created.id,
-      meta: { email, profile: data.profile, permissions, invited: sendInvite },
+      meta: { email, profile: data.profile, permissions, groupIds, invited: sendInvite },
     });
 
     res.status(201).json({
@@ -273,6 +322,10 @@ router.patch(
       });
       if (!contractor) throw BadRequest("Fornecedor não encontrado.");
     }
+
+    const nextGroupIds = data.groupIds
+      ? await assertGroups(companyId(req), data.groupIds, id)
+      : undefined;
 
     const nextProfile = data.profile ?? existing.profile;
     const nextContractorId =
@@ -314,6 +367,9 @@ router.patch(
         data.obraIds,
         nextAllObrasAccess,
       );
+    }
+    if (nextGroupIds) {
+      await syncUserGroups(updated.id, nextGroupIds);
     }
 
     const permissionsChanged =

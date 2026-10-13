@@ -7,12 +7,12 @@ import { Forbidden, Unauthorized } from "../lib/errors.js";
 import {
   hasAnyCapability,
   hasCapability,
-  normalizePermissions,
   type PermissionKey,
   type PermissionList,
 } from "../lib/permissions.js";
 import {
   loadAllowedDocumentTypesForUser,
+  loadEffectivePermissions,
   loadObraIdsForUser,
   resolveActiveObraId,
   type AuthScope,
@@ -73,6 +73,7 @@ async function buildAuthUser(
     select: {
       active: true,
       allObrasAccess: true,
+      permissions: true,
       company: { select: { blocked: true, licenseExpiresAt: true } },
     },
   });
@@ -89,7 +90,13 @@ async function buildAuthUser(
     throw Forbidden("Licença expirada. Entre em contato com o suporte NEO.");
   }
 
-  const permissions = normalizePermissions(decoded.permissions);
+  // Lidas do banco (não do JWT): individuais + grupos ativos. Assim revogar
+  // uma permissão ou mudar o grupo vale já na próxima requisição.
+  const permissions = await loadEffectivePermissions({
+    userId: decoded.sub,
+    companyId: decoded.companyId,
+    ownPermissions: account.permissions,
+  });
   const obraIds = await loadObraIdsForUser({
     userId: decoded.sub,
     companyId: decoded.companyId,

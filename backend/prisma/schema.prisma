@@ -489,6 +489,9 @@ model UserGroup {
   /// Tipos de documento (Segurança/Padrão) que membros deste grupo podem
   /// visualizar. Lista vazia = sem restrição (vê todos os tipos).
   visibleDocumentTypes DocumentType[] @default([])
+  /// Permissões (chaves de ação, ver lib/permissions.ts) concedidas a todos
+  /// os membros. Somam-se às permissões individuais do usuário.
+  permissions          String[]       @default([])
   createdAt            DateTime       @default(now())
   updatedAt            DateTime       @updatedAt
 

@@ -5,6 +5,8 @@ import { prisma } from "../../lib/prisma.js";
 import { asyncHandler } from "../../middleware/async-handler.js";
 import { authenticate, requireCapability } from "../../middleware/auth.js";
 import { NotFound, Unauthorized } from "../../lib/errors.js";
+import { ALL_PERMISSION_KEYS, type PermissionKey } from "../../lib/permissions.js";
+import { auditContext, recordAudit } from "../../lib/audit.js";
 
 const router = Router();
 router.use(authenticate);
@@ -22,7 +24,15 @@ const upsertSchema = z.object({
   /// Tipos de documento (SAFETY/STANDARD) que membros deste grupo podem
   /// visualizar. Vazio/omitido = sem restrição (vê todos os tipos).
   visibleDocumentTypes: z.array(z.nativeEnum(DocumentType)).optional(),
+  /// Permissões (chaves de ação) concedidas a todos os membros.
+  permissions: z.array(z.string()).optional(),
 });
+
+function sanitizePermissions(input: string[]): PermissionKey[] {
+  return [...new Set(input)].filter((k): k is PermissionKey =>
+    ALL_PERMISSION_KEYS.includes(k as PermissionKey),
+  );
+}
 
 async function withMembers(group: { id: string }) {
   const members = await prisma.userGroupMember.findMany({
@@ -89,6 +99,7 @@ router.post(
         description: data.description,
         active: data.active ?? true,
         visibleDocumentTypes: data.visibleDocumentTypes ?? [],
+        permissions: sanitizePermissions(data.permissions ?? []),
       },
     });
 
@@ -110,9 +121,12 @@ router.patch(
 
     const existing = await prisma.userGroup.findFirst({
       where: { id, companyId: companyIdValue },
-      select: { id: true },
+      select: { id: true, permissions: true },
     });
     if (!existing) throw NotFound("Grupo não encontrado");
+
+    const nextPermissions =
+      data.permissions !== undefined ? sanitizePermissions(data.permissions) : undefined;
 
     const updated = await prisma.userGroup.update({
       where: { id },
@@ -123,8 +137,23 @@ router.patch(
         ...(data.visibleDocumentTypes !== undefined
           ? { visibleDocumentTypes: data.visibleDocumentTypes }
           : {}),
+        ...(nextPermissions !== undefined ? { permissions: nextPermissions } : {}),
       },
     });
+
+    if (
+      nextPermissions !== undefined &&
+      JSON.stringify([...existing.permissions].sort()) !==
+        JSON.stringify([...nextPermissions].sort())
+    ) {
+      await recordAudit({
+        ...auditContext(req),
+        action: "GROUP_PERMISSIONS_CHANGED",
+        entityType: "user_group",
+        entityId: id,
+        meta: { permissionsBefore: existing.permissions, permissionsAfter: nextPermissions },
+      });
+    }
 
     if (data.memberIds !== undefined) {
       await syncMembers(id, companyIdValue, data.memberIds);
