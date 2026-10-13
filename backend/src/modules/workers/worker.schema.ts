@@ -187,6 +187,8 @@ export const listWorkersQuerySchema = z.object({
   email: z.string().optional(),
   contractorId: z.string().optional(),
   functionId: z.string().optional(),
+  /** Texto contido no cargo (role) OU no nome da função do catálogo. */
+  role: z.string().optional(),
 
   /** Turno: DAY | NIGHT | NONE. Filtrado em memória no assignment ativo. */
   shift: z.enum(["DAY", "NIGHT", "NONE"]).optional(),

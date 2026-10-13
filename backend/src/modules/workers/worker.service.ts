@@ -814,6 +814,15 @@ export class WorkerService {
       assignmentScopeWhere(scope);
     if (query.contractorId) assignmentFilter.contractorId = query.contractorId;
     if (query.functionId) assignmentFilter.functionId = query.functionId;
+    // Cargo é texto livre e a função do catálogo é opcional: buscar só por um
+    // dos dois esconde quem foi cadastrado apenas com o outro.
+    if (query.role?.trim()) {
+      const term = query.role.trim();
+      assignmentFilter.OR = [
+        { role: { contains: term, mode: "insensitive" } },
+        { function: { name: { contains: term, mode: "insensitive" } } },
+      ];
+    }
     if (query.status) assignmentFilter.status = query.status;
     if (query.phase) assignmentFilter.phase = query.phase;
     if (query.registration?.trim()) {
